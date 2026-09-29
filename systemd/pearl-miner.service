@@ -1,0 +1,23 @@
+[Unit]
+Description=Pearl V3 GPU miner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pearl
+Group=pearl
+WorkingDirectory=/etc/pearl-miner
+ExecStart=/usr/local/bin/pearl-miner
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pearl-miner
+Environment=RUST_LOG=info
+EnvironmentFile=-/etc/pearl-miner/stateaa.env
+
+[Install]
+WantedBy=multi-user.target

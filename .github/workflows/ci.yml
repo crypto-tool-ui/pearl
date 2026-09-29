@@ -1,0 +1,145 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: CPU Rust checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Check out pinned Pearl source dependency
+        uses: actions/checkout@v4
+        with:
+          repository: pearl-research-labs/pearl
+          ref: 3fe226761a139a9652b8f28a6464a4bbc25986c8
+          path: pearl
+          persist-credentials: false
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Run CPU-only tests
+        run: cargo test --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test miner through Python tunnel and Node proxy
+        run: |
+          npm ci --ignore-scripts --prefix proxy
+          python -m pip install -r requirements-tunnel.txt
+          python tools/test_tunnel.py
+
+  node-proxy:
+    name: Node proxy tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tools/proxy/package-lock.json
+      - name: Install proxy dependencies
+        working-directory: tools/proxy
+        run: npm ci
+      - name: Run proxy tests
+        working-directory: tools/proxy
+        run: npm test
+
+  linux:
+    name: Linux x64 CUDA release build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out pinned Pearl source dependency
+        uses: actions/checkout@v4
+        with:
+          repository: pearl-research-labs/pearl
+          ref: 3fe226761a139a9652b8f28a6464a4bbc25986c8
+          path: pearl
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config binutils ripgrep
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.0.0"
+          method: network
+          sub-packages: '["nvcc", "cudart-dev", "cccl", "cuobjdump"]'
+      - name: Build miner with embedded sm_75, sm_90a and sm_120a cubins
+        run: |
+          nvcc --version
+          export NVCC="$(command -v nvcc)"
+          cargo build --release --locked -p pearl-miner
+          cargo test --locked -p pearl-gpu --features gpu --test sm75 --no-run
+          target/release/pearl-miner --help
+          target/release/pearl-miner --benchmark
+      - name: Verify CUDA kernels without a GPU
+        run: |
+          bash tools/check_sm75_sass.sh
+          bash tools/check_sm120_sass.sh
+          bash tools/check_sm90_sass.sh
+          bash tools/check_tensor_hash.sh
+      - name: Verify no shared OpenSSL dependency
+        run: |
+          readelf -d target/release/pearl-miner > target/release/pearl-miner.dynamic.txt
+          cat target/release/pearl-miner.dynamic.txt
+          if grep -E 'NEEDED.*lib(crypto|ssl)\.so' target/release/pearl-miner.dynamic.txt; then
+            echo 'Unexpected shared OpenSSL dependency' >&2
+            exit 1
+          fi
+      - name: Package release
+        env:
+          BUILD_REF: ${{ github.ref_name }}
+          BUILD_SHA: ${{ github.sha }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          version="git-${BUILD_SHA:0:12}"
+          if [[ "$IS_TAG" == true ]]; then version="$BUILD_REF"; fi
+          bash tools/package-release.sh "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pearl-miner-linux-x64-cuda13
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [cpu, node-proxy, linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pearl-miner-linux-x64-cuda13
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

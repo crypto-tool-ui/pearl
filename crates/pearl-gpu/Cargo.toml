@@ -1,0 +1,29 @@
+[package]
+name = "pearl-gpu"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CUDA loader and V3 tensor-core kernels for Pearl"
+build = "build.rs"
+
+[features]
+default = []
+gpu = []
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+pearl-ref = { path = "../pearl-ref" }
+pearl-blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# `driver` exposes cudarc's checked driver API. Dynamic loading means this does not require the
+# CUDA driver or toolkit at compile time; the requested CUDA 13.0 binding set remains explicit.
+cudarc = { version = "0.19.10", default-features = false, features = [
+    "std",
+    "dynamic-loading",
+    "cuda-13000",
+    "driver",
+] }

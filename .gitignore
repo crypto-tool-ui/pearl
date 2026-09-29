@@ -1,0 +1,12 @@
+/target/
+/pearl/
+/spark-pearl-miner/
+/.cargo/
+*.swp
+IAminer
+B200-Engine8-1440PH
+node_modules/
+.venv/
+__pycache__/
+
+/dist/

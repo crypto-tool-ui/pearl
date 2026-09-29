@@ -1,0 +1,13 @@
+# Pool endpoint, wallet, worker, and log file come only from STATEAA.
+# Example: printf '%s' 'stratum+ssl://prl-us.kryptex.network:8048|YOUR_WALLET|worker-1|/var/log/pearl-miner.jsonl' | xxd -p -c 9999
+
+[mining]
+device = 0
+
+[metrics]
+# listen = "127.0.0.1:9835"
+
+[cuda]
+# power_limit_watts = 700
+# graphics_clock_mhz = 1800
+# memory_clock_mhz = 2500
