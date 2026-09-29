@@ -13,7 +13,7 @@ CUOBJDUMP=/usr/local/cuda/bin/cuobjdump \
 tools/check_sm90_sass.sh
 ```
 
-It must report WGMMA/QGMMA in SASS and verify the source contract for WGMMA fence/commit/wait,
+It must report INT8 IGMMA and bulk-copy UBLKCP in SASS and verify the source contract for WGMMA fence/commit/wait,
 TMA bulk copies, transaction barriers, the sm_90a architecture guard, and the V3 fused digest.
 
 Hardware acceptance requires an H100 or another compute-capability-9.0 device:

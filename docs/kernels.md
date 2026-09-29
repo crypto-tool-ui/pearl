@@ -128,7 +128,7 @@ The loader has a `WgmmaSm90CudaKernel` implementation for compute capability 9.0
 behind the M4 acceptance gate; compute capability 12.0 selects `MmaSm120CudaKernel`. Until
 `tools/run_sm90_acceptance.sh` passes, sm_90 production dispatch returns an update-required error
 instead of selecting an unaccepted path. The no-GPU static gate is
-`tools/check_sm90_sass.sh` and requires WGMMA/QGMMA plus the async transfer instructions in SASS.
+`tools/check_sm90_sass.sh` and requires INT8 IGMMA and bulk-copy UBLKCP plus the async transfer instructions in SASS.
 
 ## M5 GPU-resident tensor hash and job ring
 

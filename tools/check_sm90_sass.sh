@@ -60,12 +60,15 @@ sass="$out_dir/pearl_sm90_wgmma.sass"
   -o "$cubin" "$source_file"
 "$cuobjdump_bin" -sass "$cubin" > "$sass"
 
-if ! rg -Eq 'WGMMA|QGMMA' "$sass"; then
-  echo "sm_90a SASS is missing WGMMA/QGMMA" >&2
+# Hopper lowers signed INT8 wgmma.mma_async to IGMMA, not FP8 QGMMA.
+# ripgrep already supports alternation; its -E option selects an encoding.
+if ! rg -q '\bIGMMA\.64x8x32\.S8\.S8\b' "$sass"; then
+  echo "sm_90a SASS is missing signed INT8 IGMMA.64x8x32.S8.S8" >&2
   exit 1
 fi
-if ! rg -Eq 'LDGSTS|CP_ASYNC' "$sass"; then
-  echo "sm_90a SASS is missing an async global-to-shared transfer" >&2
+if ! rg -q '\bUBLKCP\.S\.G\b' "$sass"; then
+  echo "sm_90a SASS is missing bulk global-to-shared UBLKCP.S.G" >&2
   exit 1
 fi
-printf 'WGMMA='; rg -ci 'WGMMA|QGMMA' "$sass"
+printf 'IGMMA='; rg -c '\bIGMMA\.64x8x32\.S8\.S8\b' "$sass"
+printf 'UBLKCP='; rg -c '\bUBLKCP\.S\.G\b' "$sass"
