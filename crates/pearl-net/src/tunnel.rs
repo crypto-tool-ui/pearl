@@ -124,7 +124,7 @@ pub(crate) async fn connect(tcp: TcpStream) -> Result<Box<dyn PoolStream>> {
         // A lost upstream session must also close the miner stream and force a fresh handshake.
         let result = tokio::select! { result = send => result, result = receive => result };
         if let Err(error) = result {
-            tracing::debug!(%error, "tunnel session ended");
+            tracing::debug!(%error, "トンネルセッションが終了しました");
         }
     });
     Ok(Box::new(app))

@@ -469,7 +469,7 @@ impl KryptexSession {
                                     let _ = reply_tx.send(Ok(SubmitResult::Rejected { kind, reason }));
                                 }
                             } else {
-                                tracing::debug!(id, accepted, "Kryptex reply");
+                                tracing::debug!(id, accepted, "Kryptexからの応答");
                             }
                         }
                     }
@@ -733,5 +733,5 @@ fn classify_reject(reason: &str) -> RejectKind {
 }
 
 fn tracing_error(error: &anyhow::Error) {
-    tracing::warn!(error = %format!("{error:#}"), "pool reconnect failed");
+    tracing::warn!(error = %format!("{error:#}"), "プールへの再接続に失敗しました");
 }

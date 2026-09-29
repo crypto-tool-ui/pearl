@@ -138,12 +138,12 @@ function startProxy({ host = process.env.PEARL_PROXY_LISTEN_HOST || '127.0.0.1',
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('PEARL_PROXY_PORT is invalid');
   const server = net.createServer((socket) => relayConnection(socket, endpoint, identityPrivate));
   server.on('error', (error) => {
-    console.error(`[pearl-proxy] server error: ${error.message}`);
+    console.error(`[pearl-proxy] サーバーエラー: ${error.message}`);
   });
   server.listen(port, host, () => {
     const address = server.address();
-    console.log(`[pearl-proxy] listening on ${typeof address === 'string' ? address : `${address.address}:${address.port}`}`);
-    console.log(`[pearl-proxy] pool ${endpoint.tls ? 'TLS' : 'TCP'} ${endpoint.host}:${endpoint.port}`);
+    console.log(`[pearl-proxy] 待受アドレス: ${typeof address === 'string' ? address : `${address.address}:${address.port}`}`);
+    console.log(`[pearl-proxy] プール: ${endpoint.tls ? 'TLS' : 'TCP'} ${endpoint.host}:${endpoint.port}`);
   });
   return server;
 }

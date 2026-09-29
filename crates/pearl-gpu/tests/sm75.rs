@@ -246,3 +246,25 @@ fn sm75_batches_match_cpu_across_blocks_and_partial_batches() {
     println!("sm_75 batched benchmark: {:.2} tiles/s (128 blocks/launch, includes CPU noise and copies)",
         2048.0 / start.elapsed().as_secs_f64());
 }
+
+#[test]
+fn sm75_resident_noise_and_mining_match_cpu_after_job_change() {
+    if option_env!("PEARL_SM75_MMA_CUBIN").is_none() { skip_gpu("T4 cubin unavailable"); return; }
+    let kernel = match std::panic::catch_unwind(|| MmaSm75CudaKernel::new(gpu_ordinal())) {
+        Ok(Ok(kernel)) => kernel,
+        _ => { skip_gpu("T4 GPU unavailable"); return; }
+    };
+    let base = test_problem().unwrap();
+    for timestamp in [base.header.timestamp, base.header.timestamp + 1] {
+        let problem = pearl_ref::test_header_variant(&base,timestamp).unwrap();
+        kernel.prepare_job(&problem).unwrap();
+        assert_eq!(kernel.batch_size(),1024);
+        let (rows,cols) = problem.tile_offsets();
+        let reference: Vec<_> = rows.iter().flat_map(|&r| cols.iter().map(move |&c| (r,c)))
+            .take(128).map(|(r,c)| problem.tile(r,c).unwrap()).collect();
+        for count in [1,3,128,1024,7] {
+            let batch: Vec<_> = reference.iter().rev().cycle().take(count).cloned().collect();
+            assert_eq!(kernel.compute_tiles(&problem,&batch).unwrap(),batch);
+        }
+    }
+}

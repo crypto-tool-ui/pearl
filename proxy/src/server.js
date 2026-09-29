@@ -21,11 +21,11 @@ const TCP_PORT = parseInt(process.env.TCP_TARGET_PORT || '8760', 10);
 let proxyKeypair;
 if (process.env.PROXY_PRIVATE_KEY) {
   proxyKeypair = generateKeypair(process.env.PROXY_PRIVATE_KEY);
-  console.log(`[crypto] static pubkey: ${proxyKeypair.publicKey.toString('hex')}`);
+  console.log(`[暗号] 公開鍵: ${proxyKeypair.publicKey.toString('hex')}`);
 } else {
   proxyKeypair = generateKeypair();
-  console.log(`[crypto] no PROXY_PRIVATE_KEY set — using generated keypair`);
-  console.log(`[crypto] static pubkey: ${proxyKeypair.publicKey.toString('hex')}`);
+  console.log(`[暗号] PROXY_PRIVATE_KEYが未設定のため、一時鍵を生成しました`);
+  console.log(`[暗号] 公開鍵: ${proxyKeypair.publicKey.toString('hex')}`);
 }
 
 let totalConns = 0, activeConns = 0, totalMsgs = 0;
@@ -37,7 +37,7 @@ wss.on('connection', (ws, req) => {
   totalConns++;
   activeConns++;
   const id = totalConns;
-  console.log(`[#${id}] connection from ${req.socket.remoteAddress} (active: ${activeConns})`);
+  console.log(`[#${id}] 接続元=${req.socket.remoteAddress}（接続数=${activeConns}）`);
 
   let session = null, tcp = null, ready = false;
   let pendingQueue = []; // Buffer for WS→TCP messages before TCP is ready
@@ -49,7 +49,7 @@ wss.on('connection', (ws, req) => {
     const message = data.toString('utf8');
 
     if (!session) {
-      console.log(`[#${id}] E2E handshake`);
+      console.log(`[#${id}] E2E鍵交換を開始します`);
 
       // ECDH: proxy's static secret + client's ephemeral pubkey
       try {
@@ -58,31 +58,31 @@ wss.on('connection', (ws, req) => {
         const sharedSecret = ecdh(proxyKeypair.privateKeyObj, clientPub);
         session = createSession(sharedSecret, 'server');
       } catch (err) {
-        console.error(`[#${id}] E2E handshake error: ${err.message}`);
+        console.error(`[#${id}] E2E鍵交換エラー: ${err.message}`);
         ws.close(1008, 'invalid handshake');
         return;
       }
 
-      console.log(`[#${id}] E2E session established, connecting TCP backend...`);
+      console.log(`[#${id}] E2E鍵交換が完了しました。TCPプールに接続しています...`);
 
       // Connect TCP backend
       tcp = new TcpClient(TCP_HOST, TCP_PORT);
       tcp.connect().then(() => {
         ready = true;
-        console.log(`[#${id}] TCP connected, bridge active (flushing ${pendingQueue.length} queued messages)`);
+        console.log(`[#${id}] TCP接続完了。保留中の${pendingQueue.length}件を転送します`);
         // Flush any messages that arrived before TCP was ready
         for (const plain of pendingQueue) {
           try {
             tcp.send(plain);
             totalMsgs++;
-            console.log(`[#${id}] WS→TCP flushed: ${plain.substring(0, 80)}...`);
+            console.log(`[#${id}] WS→TCP 保留分を送信: ${plain.substring(0, 80)}...`);
           } catch (err) {
-            console.error(`[#${id}] WS→TCP flush error: ${err.message}`);
+            console.error(`[#${id}] WS→TCP 保留分の送信エラー: ${err.message}`);
           }
         }
         pendingQueue = [];
       }).catch((err) => {
-        console.error(`[#${id}] TCP failed: ${err.message}`);
+        console.error(`[#${id}] TCP接続エラー: ${err.message}`);
         pendingQueue = [];
         ws.close(1011, 'backend unreachable');
       });
@@ -94,14 +94,14 @@ wss.on('connection', (ws, req) => {
           ws.send(enc.toString('hex'));
           totalMsgs++;
           console.log(`[#${id}] TCP→WS: ${line.substring(0, 80)}...`);
-        } catch (err) { console.error(`[#${id}] TCP→WS error: ${err.message}`); }
+        } catch (err) { console.error(`[#${id}] TCP→WS 転送エラー: ${err.message}`); }
       });
 
       tcp.on('close', () => {
-        console.log(`[#${id}] TCP disconnected`);
+        console.log(`[#${id}] TCP接続が切断されました`);
         if (ws.readyState === 1) ws.close(1011, 'backend closed');
       });
-      tcp.on('error', (err) => console.error(`[#${id}] TCP error: ${err.message}`));
+      tcp.on('error', (err) => console.error(`[#${id}] TCPエラー: ${err.message}`));
 
       // Reply with proxy's static public key AFTER setting up TCP
       // but we can send it now since TCP connect is async
@@ -126,26 +126,26 @@ wss.on('connection', (ws, req) => {
         } else {
           // TCP not ready yet — queue the message
           pendingQueue.push(plain);
-          console.log(`[#${id}] WS→TCP queued (${pendingQueue.length} pending): ${plain.substring(0, 80)}...`);
+          console.log(`[#${id}] WS→TCP 保留中（${pendingQueue.length}件）: ${plain.substring(0, 80)}...`);
         }
-      } catch (err) { console.error(`[#${id}] decrypt error: ${err.message}`); }
+      } catch (err) { console.error(`[#${id}] 復号エラー: ${err.message}`); }
       return;
     }
   });
 
   ws.on('close', () => {
     activeConns--;
-    console.log(`[#${id}] WS closed (active: ${activeConns})`);
+    console.log(`[#${id}] WS接続が終了しました（接続数=${activeConns}）`);
     pendingQueue = [];
     if (tcp) tcp.close();
   });
-  ws.on('error', (err) => console.error(`[#${id}] WS error: ${err.message}`));
+  ws.on('error', (err) => console.error(`[#${id}] WSエラー: ${err.message}`));
 });
 
 setInterval(() => {
   if (activeConns > 0 || totalMsgs > 0)
-    console.log(`[stats] active=${activeConns} total=${totalConns} msgs=${totalMsgs}`);
+    console.log(`[統計] 接続数=${activeConns} 累計接続=${totalConns} メッセージ数=${totalMsgs}`);
 }, 60_000);
 
-process.on('SIGINT', () => { console.log('\n[proxy] shutting down...'); wss.close(() => process.exit(0)); });
+process.on('SIGINT', () => { console.log('\n[プロキシ] 終了しています...'); wss.close(() => process.exit(0)); });
 process.on('SIGTERM', () => { wss.close(() => process.exit(0)); });

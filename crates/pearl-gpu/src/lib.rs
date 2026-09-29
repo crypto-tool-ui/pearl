@@ -67,6 +67,7 @@ pub struct KernelMetadata {
 pub trait GemmKernel {
     fn metadata(&self) -> KernelMetadata;
     fn compute_tile(&self, problem: &Problem, tile: &TileResult) -> Result<TileResult>;
+    fn prepare_job(&self, _problem: &Problem) -> Result<()> { Ok(()) }
     fn batch_size(&self) -> usize { 1 }
     fn compute_tiles(&self, problem: &Problem, tiles: &[TileResult]) -> Result<Vec<TileResult>> {
         tiles.iter().map(|tile| self.compute_tile(problem, tile)).collect()

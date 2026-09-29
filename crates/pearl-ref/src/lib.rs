@@ -207,6 +207,19 @@ impl Problem {
             .clone()
     }
 
+    /// Compact official noise permutations used by the resident GPU preparation path.
+    pub fn noise_permutations(&self) -> (Vec<u32>, Vec<u32>) {
+        use zk_pow::circuit::pearl_noise::generate_permutation_matrix;
+        let commitment = self.commitment();
+        let mut label_a = [0u8; 32];
+        let mut label_b = [0u8; 32];
+        label_a[..8].copy_from_slice(b"A_tensor");
+        label_b[..8].copy_from_slice(b"B_tensor");
+        let a = generate_permutation_matrix(&label_a, &commitment.a_noise_seed, self.k(), self.config.rank as usize);
+        let b = generate_permutation_matrix(&label_b, &commitment.b_noise_seed, self.k(), self.config.rank as usize);
+        (a.into_iter().flatten().collect(), b.into_iter().flatten().collect())
+    }
+
     /// Returns the selected A rows and B^T columns after applying the official V3 noise.
     ///
     /// This is the host/device boundary for the M2 oracle. The noise construction and the

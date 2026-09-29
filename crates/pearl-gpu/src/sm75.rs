@@ -4,9 +4,9 @@ use crate::{
     LoadedCudaKernel,
 };
 use anyhow::{bail, ensure, Context, Result};
-use cudarc::driver::{result, sys, CudaContext, DevicePtr, DevicePtrMut};
+use cudarc::driver::{result, sys, CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
 use pearl_ref::{compute_jackpot_hash, MMAType, Problem, TileResult};
-use std::{ffi::c_void, sync::Arc};
+use std::{cell::RefCell, ffi::c_void, sync::Arc};
 const SM75_MMA_M: usize = 8;
 const SM75_MMA_N: usize = 8;
 const SM75_MMA_K: usize = 16;
@@ -18,6 +18,7 @@ pub struct MmaSm75CudaKernel {
     max_threads_per_block: usize,
     max_block_dim_x: usize,
     max_dynamic_shared_memory: usize,
+    resident: RefCell<Option<ResidentJob>>,
 }
 
 impl MmaSm75CudaKernel {
@@ -75,6 +76,7 @@ impl MmaSm75CudaKernel {
             max_threads_per_block,
             max_block_dim_x,
             max_dynamic_shared_memory,
+            resident: RefCell::new(None),
         })
     }
 
@@ -277,7 +279,9 @@ impl MmaSm75CudaKernel {
                 let (transcript_ptr, _transcript_sync) = d_transcript.device_ptr_mut(&stream);
                 let (a_noise_seed_ptr, _a_noise_seed_sync) = d_a_noise_seed.device_ptr(&stream);
                 let (digest_ptr, _digest_sync) = d_digest.device_ptr_mut(&stream);
-                let mut params: [*mut c_void; 12] = [
+                let null_pointer: sys::CUdeviceptr = 0;
+                let resident = 0u32;
+                let mut params: [*mut c_void; 15] = [
                     (&a_ptr as *const sys::CUdeviceptr).cast_mut().cast(),
                     (&bt_ptr as *const sys::CUdeviceptr).cast_mut().cast(),
                     (&logical_h as *const u32).cast_mut().cast(),
@@ -294,6 +298,9 @@ impl MmaSm75CudaKernel {
                         .cast_mut()
                         .cast(),
                     (&digest_ptr as *const sys::CUdeviceptr).cast_mut().cast(),
+                    param(&null_pointer),
+                    param(&null_pointer),
+                    param(&resident),
                 ];
                 unsafe {
                     result::launch_kernel(
@@ -330,17 +337,48 @@ impl GemmKernel for MmaSm75CudaKernel {
         }
     }
 
-    fn batch_size(&self) -> usize { 128 }
+    fn prepare_job(&self, problem: &Problem) -> Result<()> {
+        // Drop the previous job before allocating the next, bounding VRAM across job changes.
+        self.resident.borrow_mut().take();
+        *self.resident.borrow_mut() = Some(self.prepare_resident(problem)?);
+        Ok(())
+    }
+    fn batch_size(&self) -> usize {
+        if self.resident.borrow().is_some() {
+            1024
+        } else {
+            128
+        }
+    }
 
     fn compute_tile(&self, problem: &Problem, tile: &TileResult) -> Result<TileResult> {
-        Ok(self.compute_tiles(problem, std::slice::from_ref(tile))?.remove(0))
+        Ok(self
+            .compute_tiles(problem, std::slice::from_ref(tile))?
+            .remove(0))
     }
 
     fn compute_tiles(&self, problem: &Problem, tiles: &[TileResult]) -> Result<Vec<TileResult>> {
-        if tiles.is_empty() { return Ok(Vec::new()); }
-        ensure!(tiles.len() <= self.batch_size(), "sm_75 batch exceeds 128 tiles");
+        if tiles.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(resident) = self.resident.borrow_mut().as_mut() {
+            if resident.key == problem.commitment().a_noise_seed
+                && resident.shape == (problem.m, problem.n, problem.k(), problem.config.rank)
+            {
+                return self.compute_resident(problem, tiles, resident);
+            }
+        }
+        ensure!(
+            tiles.len() <= 128,
+            "sm_75 unprepared batch exceeds 128 tiles"
+        );
         let first = &tiles[0];
-        ensure!(tiles.iter().all(|t| t.rows.len() == first.rows.len() && t.cols.len() == first.cols.len()), "sm_75 batch tile shapes differ");
+        ensure!(
+            tiles
+                .iter()
+                .all(|t| t.rows.len() == first.rows.len() && t.cols.len() == first.cols.len()),
+            "sm_75 batch tile shapes differ"
+        );
         let operands = problem.noised_tiles_operands(tiles)?;
         let mut a = Vec::new();
         let mut bt = Vec::new();
@@ -358,16 +396,259 @@ impl GemmKernel for MmaSm75CudaKernel {
         let effective_k = (problem.k() / rank) * rank;
         let commitment = problem.commitment();
         let (transcripts, digests) = self.launch_transcript(
-            &a, &bt, first.rows.len() as u32, first.cols.len() as u32,
-            padded_h, padded_w, problem.k() as u32, effective_k as u32,
-            rank as u32, &commitment.a_noise_seed, tiles.len(),
+            &a,
+            &bt,
+            first.rows.len() as u32,
+            first.cols.len() as u32,
+            padded_h,
+            padded_w,
+            problem.k() as u32,
+            effective_k as u32,
+            rank as u32,
+            &commitment.a_noise_seed,
+            tiles.len(),
         )?;
-        tiles.iter().enumerate().map(|(index, tile)| {
-            let transcript = transcripts[index * 16..(index + 1) * 16].try_into().unwrap();
-            let digest = digests[index * 32..(index + 1) * 32].try_into().unwrap();
-            ensure!(digest == compute_jackpot_hash(&transcript, commitment.a_noise_seed),
-                "sm_75 fused BLAKE3 digest does not match the returned transcript");
-            Ok(TileResult { transcript, digest, ..tile.clone() })
-        }).collect()
+        tiles
+            .iter()
+            .enumerate()
+            .map(|(index, tile)| {
+                let transcript = transcripts[index * 16..(index + 1) * 16]
+                    .try_into()
+                    .unwrap();
+                let digest = digests[index * 32..(index + 1) * 32].try_into().unwrap();
+                ensure!(
+                    digest == compute_jackpot_hash(&transcript, commitment.a_noise_seed),
+                    "sm_75 fused BLAKE3 digest does not match the returned transcript"
+                );
+                Ok(TileResult {
+                    transcript,
+                    digest,
+                    ..tile.clone()
+                })
+            })
+            .collect()
+    }
+}
+
+fn param<T>(value: &T) -> *mut c_void {
+    (value as *const T).cast_mut().cast()
+}
+
+struct ResidentJob {
+    key: [u8; 32],
+    shape: (u32, u32, usize, u16),
+    a: CudaSlice<i8>,
+    bt: CudaSlice<i8>,
+    seed: CudaSlice<u8>,
+    rows: CudaSlice<u32>,
+    cols: CudaSlice<u32>,
+    transcript: CudaSlice<u32>,
+    digest: CudaSlice<u8>,
+}
+
+impl MmaSm75CudaKernel {
+    fn prepare_resident(&self, problem: &Problem) -> Result<ResidentJob> {
+        ensure!(
+            problem.config.mma_type == MMAType::Int7xInt7ToInt32 && problem.config.moe.is_none(),
+            "T4 requires dense V3 INT7 inputs"
+        );
+        let rank = problem.config.rank as u32;
+        ensure!(
+            rank >= 32 && rank.is_power_of_two() && problem.k() % 16 == 0,
+            "unsupported T4 noise dimensions"
+        );
+        let stream = self.context.default_stream();
+        let cubin = embedded_cubin!("PEARL_SM75_MMA_CUBIN").context("T4 cubin unavailable")?;
+        let uniform_kernel = load_cuda_kernel(&self.context, cubin, "pearl_sm75_uniform")?;
+        let noise_kernel = load_cuda_kernel(&self.context, cubin, "pearl_sm75_apply_noise")?;
+        let commitment = problem.commitment();
+        let (permutation_a, permutation_b) = problem.noise_permutations();
+        let prepare = |matrix: &[i8],
+                       seed: &[u8; 32],
+                       permutation: &[u32],
+                       is_b: u32|
+         -> Result<CudaSlice<i8>> {
+            let cells = u32::try_from(matrix.len()).context("T4 matrix exceeds u32 indexing")?;
+            let k = u32::try_from(problem.k())?;
+            let uniform_len = (matrix.len() / problem.k())
+                .checked_mul(rank as usize)
+                .context("noise size overflow")?;
+            let blocks = u32::try_from(uniform_len / 32)?;
+            let mut data = stream.clone_htod(matrix)?;
+            let mut uniform = stream.alloc_zeros::<i8>(uniform_len)?;
+            let d_seed = stream.clone_htod(seed)?;
+            let d_permutation = stream.clone_htod(permutation)?;
+            {
+                let (out, _guard) = uniform.device_ptr_mut(&stream);
+                let (key, _key_guard) = d_seed.device_ptr(&stream);
+                let mut args = [param(&out), param(&blocks), param(&key), param(&is_b)];
+                unsafe {
+                    result::launch_kernel(
+                        uniform_kernel.function,
+                        (blocks.div_ceil(128), 1, 1),
+                        (128, 1, 1),
+                        0,
+                        stream.cu_stream(),
+                        &mut args,
+                    )
+                }?;
+            }
+            {
+                let (out, _guard) = data.device_ptr_mut(&stream);
+                let (noise, _noise_guard) = uniform.device_ptr(&stream);
+                let (perm, _perm_guard) = d_permutation.device_ptr(&stream);
+                let mut args = [
+                    param(&out),
+                    param(&cells),
+                    param(&k),
+                    param(&rank),
+                    param(&noise),
+                    param(&perm),
+                ];
+                unsafe {
+                    result::launch_kernel(
+                        noise_kernel.function,
+                        (cells.div_ceil(256), 1, 1),
+                        (256, 1, 1),
+                        0,
+                        stream.cu_stream(),
+                        &mut args,
+                    )
+                }?;
+            }
+            stream.synchronize()?;
+            Ok(data)
+        };
+        let a = prepare(&problem.a, &commitment.a_noise_seed, &permutation_a, 0)?;
+        let bt = prepare(&problem.bt, &commitment.b_noise_seed, &permutation_b, 1)?;
+        let tile = problem.empty_tile(0, 0)?;
+        Ok(ResidentJob {
+            key: commitment.a_noise_seed,
+            shape: (problem.m, problem.n, problem.k(), problem.config.rank),
+            a,
+            bt,
+            seed: stream.clone_htod(&commitment.a_noise_seed)?,
+            rows: stream.alloc_zeros::<u32>(1024 * tile.rows.len())?,
+            cols: stream.alloc_zeros::<u32>(1024 * tile.cols.len())?,
+            transcript: stream.alloc_zeros::<u32>(1024 * 16)?,
+            digest: stream.alloc_zeros::<u8>(1024 * 32)?,
+        })
+    }
+
+    fn compute_resident(
+        &self,
+        problem: &Problem,
+        tiles: &[TileResult],
+        job: &mut ResidentJob,
+    ) -> Result<Vec<TileResult>> {
+        ensure!(tiles.len() <= 1024, "T4 resident batch exceeds 1024 tiles");
+        let h = tiles[0].rows.len() as u32;
+        let w = tiles[0].cols.len() as u32;
+        for tile in tiles {
+            ensure!(
+                tile.rows.len() == h as usize && tile.cols.len() == w as usize,
+                "inconsistent T4 tile shapes"
+            );
+            ensure!(
+                tile.rows == problem.config.rows_pattern.indices_with_offset(tile.t_rows)
+                    && tile.cols == problem.config.cols_pattern.indices_with_offset(tile.t_cols),
+                "T4 tile pattern mismatch"
+            );
+            ensure!(
+                tile.rows.iter().all(|&r| r < problem.m)
+                    && tile.cols.iter().all(|&c| c < problem.n),
+                "T4 tile out of bounds"
+            );
+        }
+        let ph = h.div_ceil(8) * 8;
+        let pw = w.div_ceil(8) * 8;
+        let warps = (ph / 8) * (pw / 8);
+        let threads = warps * 32;
+        let shared = h
+            .checked_mul(w)
+            .and_then(|x| x.checked_mul(4))
+            .context("T4 shared size overflow")?;
+        ensure!(
+            warps > 0
+                && warps <= 32
+                && threads as usize <= self.max_threads_per_block
+                && threads as usize <= self.max_block_dim_x
+                && shared as usize <= self.max_dynamic_shared_memory,
+            "T4 tile exceeds launch limits"
+        );
+        let k = problem.k() as u32;
+        let rank = problem.config.rank as u32;
+        let effective = k / rank * rank;
+        ensure!(effective > 0, "T4 effective K is zero");
+        let rows: Vec<u32> = tiles.iter().flat_map(|t| t.rows.iter().copied()).collect();
+        let cols: Vec<u32> = tiles.iter().flat_map(|t| t.cols.iter().copied()).collect();
+        let stream = self.context.default_stream();
+        stream.memcpy_htod(&rows, &mut job.rows.slice_mut(..rows.len()))?;
+        stream.memcpy_htod(&cols, &mut job.cols.slice_mut(..cols.len()))?;
+        unsafe {
+            result::function::set_function_attribute(
+                self.kernel.function,
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                shared as i32,
+            )
+        }?;
+        {
+            let (a, _ag) = job.a.device_ptr(&stream);
+            let (bt, _bg) = job.bt.device_ptr(&stream);
+            let (seed, _sg) = job.seed.device_ptr(&stream);
+            let (rows, _rg) = job.rows.device_ptr(&stream);
+            let (cols, _cg) = job.cols.device_ptr(&stream);
+            let (transcript, _tg) = job.transcript.device_ptr_mut(&stream);
+            let (digest, _dg) = job.digest.device_ptr_mut(&stream);
+            let resident = 1u32;
+            let mut args = [
+                param(&a),
+                param(&bt),
+                param(&h),
+                param(&w),
+                param(&ph),
+                param(&pw),
+                param(&k),
+                param(&effective),
+                param(&rank),
+                param(&transcript),
+                param(&seed),
+                param(&digest),
+                param(&rows),
+                param(&cols),
+                param(&resident),
+            ];
+            unsafe {
+                result::launch_kernel(
+                    self.kernel.function,
+                    (tiles.len() as u32, 1, 1),
+                    (threads, 1, 1),
+                    shared,
+                    stream.cu_stream(),
+                    &mut args,
+                )
+            }?;
+        }
+        let transcripts = stream.clone_dtoh(&job.transcript.slice(..tiles.len() * 16))?;
+        let digests = stream.clone_dtoh(&job.digest.slice(..tiles.len() * 32))?;
+        tiles
+            .iter()
+            .enumerate()
+            .map(|(index, tile)| {
+                let transcript = transcripts[index * 16..(index + 1) * 16]
+                    .try_into()
+                    .unwrap();
+                let digest = digests[index * 32..(index + 1) * 32].try_into().unwrap();
+                ensure!(
+                    digest == compute_jackpot_hash(&transcript, job.key),
+                    "T4 resident digest mismatch"
+                );
+                Ok(TileResult {
+                    transcript,
+                    digest,
+                    ..tile.clone()
+                })
+            })
+            .collect()
     }
 }

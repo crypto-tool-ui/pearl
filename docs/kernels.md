@@ -162,3 +162,18 @@ The cubin is embedded with the other architectures and capability 7.5 selects it
 in production dispatch. Run `bash tools/check_sm75_sass.sh` for compilation and
 IMMA inspection, then `bash tools/run_sm75_acceptance.sh` on T4 for correctness
 and benchmark acceptance. No hardware acceptance result is recorded yet.
+
+### T4 resident job preparation
+
+The production T4 path calls `prepare_job` once per job. CUDA computes the keyed
+uniform noise factors and applies official CPU-generated sparse permutations to
+the raw matrices in place. Full noised matrices remain on the device. One batch
+(up to 1024 CTAs) gathers rows/columns by index; accumulator/digest output and index
+buffers are reused. The previous padded-input path remains available to tests.
+Job changes drop the previous resident allocation before allocating the next.
+CPU commitments and final share verification remain unchanged.
+
+`tools/verify_sm75_noise.py` verifies scalar noise arithmetic against the official
+reference on CPU, while `sm75_resident_noise_and_mining_match_cpu_after_job_change`
+requires a T4 and checks full/partial batches and changed seed material. No GPU
+utilization improvement has been measured in the development environment.

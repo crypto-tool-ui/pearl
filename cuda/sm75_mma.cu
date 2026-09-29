@@ -101,9 +101,12 @@ extern "C" __global__ void pearl_sm75_mma_tile(
     uint32_t logical_h, uint32_t logical_w,
     uint32_t padded_h, uint32_t padded_w,
     uint32_t physical_k, uint32_t effective_k, uint32_t rank,
-    uint32_t* transcript, const uint8_t* a_noise_seed, uint8_t* digest) {
-  a += static_cast<size_t>(blockIdx.x) * padded_h * physical_k;
-  bt += static_cast<size_t>(blockIdx.x) * padded_w * physical_k;
+    uint32_t* transcript, const uint8_t* a_noise_seed, uint8_t* digest,
+    const uint32_t* rows, const uint32_t* cols, uint32_t resident) {
+  if (!resident) {
+    a += static_cast<size_t>(blockIdx.x) * padded_h * physical_k;
+    bt += static_cast<size_t>(blockIdx.x) * padded_w * physical_k;
+  }
   transcript += blockIdx.x * 16;
   digest += blockIdx.x * 32;
   // Uniform checks: every thread in this CTA reaches every block barrier.
@@ -119,15 +122,21 @@ extern "C" __global__ void pearl_sm75_mma_tile(
   const uint32_t group = lane >> 2;
   const uint32_t thread = lane & 3;
   extern __shared__ int32_t accum[];
+  if (threadIdx.x < 16) transcript[threadIdx.x] = 0;
+  __syncthreads();
   int32_t d[2] = {0, 0};
+  const uint32_t ar = row_base + group;
+  const uint32_t bc = col_base + group;
+  const uint32_t source_a = resident && ar < logical_h ? rows[blockIdx.x * logical_h + ar] : ar;
+  const uint32_t source_b = resident && bc < logical_w ? cols[blockIdx.x * logical_w + bc] : bc;
   // Keep d cumulative across rank slices; each boundary folds the running product.
   for (uint32_t slice = 0; slice < effective_k; slice += rank) {
     for (uint32_t kk = slice; kk < slice + rank; kk += 16) {
-      const uint32_t af = load_u32_le(reinterpret_cast<const uint8_t*>(
-          a + (row_base + group) * physical_k + kk + thread * 4));
+      const uint32_t af = ar < logical_h ? load_u32_le(reinterpret_cast<const uint8_t*>(
+          a + static_cast<size_t>(source_a) * physical_k + kk + thread * 4)) : 0;
       // B is column-major in MMA; the host supplies contiguous rows of B transpose.
-      const uint32_t bf = load_u32_le(reinterpret_cast<const uint8_t*>(
-          bt + (col_base + group) * physical_k + kk + thread * 4));
+      const uint32_t bf = bc < logical_w ? load_u32_le(reinterpret_cast<const uint8_t*>(
+          bt + static_cast<size_t>(source_b) * physical_k + kk + thread * 4)) : 0;
       mma_int8(d, af, bf);
     }
     const uint32_t row = row_base + group;
@@ -146,4 +155,32 @@ extern "C" __global__ void pearl_sm75_mma_tile(
     __syncthreads();
   }
   if (threadIdx.x == 0) blake3_jackpot_hash(transcript, a_noise_seed, digest);
+}
+
+// Official get_random_hash: 64-byte message, (index+1) in word 0 or 1,
+// followed by the padded A_tensor/B_tensor label, keyed by the corresponding seed.
+extern "C" __global__ void pearl_sm75_uniform(
+    int8_t* uniform, uint32_t blocks, const uint8_t* seed, uint32_t is_b) {
+  const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= blocks) return;
+  uint32_t message[16] = {};
+  message[0] = index + 1;
+  message[8] = is_b ? 0x65745f42u : 0x65745f41u; // B_te / A_te
+  message[9] = 0x726f736eu; // nsor
+  uint8_t hash[32];
+  blake3_jackpot_hash(message, seed, hash);
+  for (uint32_t i = 0; i < 32; ++i)
+    uniform[static_cast<size_t>(index) * 32 + i] = static_cast<int8_t>((hash[i] & 63) - 32);
+}
+
+extern "C" __global__ void pearl_sm75_apply_noise(
+    int8_t* matrix, uint32_t cells, uint32_t k, uint32_t rank,
+    const int8_t* uniform, const uint32_t* permutation) {
+  const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= cells) return;
+  const uint32_t row = index / k;
+  const uint32_t col = index % k;
+  const size_t base = static_cast<size_t>(row) * rank;
+  matrix[index] = static_cast<int8_t>(static_cast<int32_t>(matrix[index]) +
+      uniform[base + permutation[col * 2]] - uniform[base + permutation[col * 2 + 1]]);
 }

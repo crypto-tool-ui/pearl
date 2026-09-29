@@ -36,15 +36,16 @@ pub fn find_verified_share(
         .ok_or_else(|| anyhow::anyhow!("Kryptex share target is unusable for this configuration"))?;
     let (row_offsets, col_offsets) = problem.tile_offsets();
     let total = row_offsets.len().saturating_mul(col_offsets.len());
-    info!(job_id = %job.job_id, tiles = total, "starting Kryptex job");
+    info!("マイニング開始 | ジョブ={} | 総タイル数={} | バッチ={}", job.job_id, total, kernel.batch_size());
     let mut scanned = 0usize;
     let started = Instant::now();
 
     let mut offsets = row_offsets.into_iter().flat_map(|row| col_offsets.iter().copied().map(move |col| (row, col)));
     let mut last_report = Instant::now();
+    let mut last_scanned = 0usize;
     loop {
         if should_cancel() {
-            warn!(job_id = %job.job_id, scanned, "Kryptex job cancelled as stale");
+            warn!(job_id = %job.job_id, scanned, "新しいジョブを受信したため、古いジョブを中止しました");
             return Ok(None);
         }
         let requests = offsets.by_ref().take(kernel.batch_size())
@@ -59,23 +60,46 @@ pub fn find_verified_share(
         let per_tile = requests[0].rows.len() as f64 * requests[0].cols.len() as f64 * problem.k() as f64;
         let hashrate = (scanned as f64 * per_tile / elapsed).min(u64::MAX as f64) as u64;
         if last_report.elapsed().as_secs() >= 10 {
-            info!(job_id = %job.job_id, scanned, batch = tiles.len(),
-                tiles_per_second = scanned as f64 / elapsed, hashrate,
-                "mining progress");
+            let current_tiles = (scanned - last_scanned) as f64 / last_report.elapsed().as_secs_f64();
+            info!("採掘状況 | ジョブ={} | ハッシュレート={} | 平均={} | タイル/秒={:.2} | 処理済み={} | バッチ={}",
+                job.job_id, format_hashrate(current_tiles * per_tile), format_hashrate(hashrate as f64),
+                current_tiles, scanned, tiles.len());
+            last_scanned = scanned;
             last_report = Instant::now();
         }
         for tile in tiles {
             if should_cancel() { return Ok(None); }
             if U256::from_little_endian(&tile.digest) > bound { continue; }
             debug!(job_id = %job.job_id, t_rows = tile.t_rows, t_cols = tile.t_cols, scanned,
-                "GPU candidate reached share bound");
+                "GPU候補がシェアの目標値を満たしました");
             let share = VerifiedShare::from_verified_tile_with_hashrate(problem, job, &tile, hashrate)
                 .context("CPU reference rejected GPU candidate")?;
             info!(job_id = %job.job_id, t_rows = tile.t_rows, t_cols = tile.t_cols, scanned,
-                "CPU-verified Kryptex share ready");
+                "CPU検証済みシェアの送信準備ができました");
             return Ok(Some(share));
         }
     }
-    info!(job_id = %job.job_id, scanned, "Kryptex job exhausted without a share");
+    info!(job_id = %job.job_id, scanned, "全タイルの処理が完了しました。シェアは見つかりませんでした");
     Ok(None)
+}
+
+// Keep the pool's existing logical h*w*k rate convention; do not count an MMA
+// multiply and add twice or confuse tile hashes/s with this work-normalized rate.
+fn format_hashrate(rate: f64) -> String {
+    for (scale, unit) in [(1e12, "TH/s"), (1e9, "GH/s"), (1e6, "MH/s"), (1e3, "kH/s")] {
+        if rate >= scale { return format!("{:.3} {unit}", rate / scale); }
+    }
+    format!("{rate:.3} H/s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn hashrate_units_match_the_reported_work_rate() {
+        assert_eq!(format_hashrate(934506703.0), "934.507 MH/s");
+        assert_eq!(format_hashrate(1e9), "1.000 GH/s");
+        assert_eq!(format_hashrate(1e12), "1.000 TH/s");
+        assert_eq!(format_hashrate(0.0), "0.000 H/s");
+    }
 }

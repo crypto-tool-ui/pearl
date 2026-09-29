@@ -101,6 +101,7 @@ jobs:
           target/release/pearl-miner --benchmark
       - name: Verify CUDA kernels without a GPU
         run: |
+          python3 tools/verify_sm75_noise.py
           bash tools/check_sm75_sass.sh
           bash tools/check_sm120_sass.sh
           bash tools/check_sm90_sass.sh

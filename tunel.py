@@ -218,7 +218,7 @@ async def AL(reader,writer,cfg,metrics,sem,log):
 						try:c.add(N.result())
 						except F:c.add(d)
 				if n in c:T='tcp_closed';break
-				D.errors+=1;J.warning('Upstream session closed; closing TCP to require a fresh E2E handshake');T='ws_closed';break
+				D.errors+=1;J.warning('上流セッションが切断されました。E2E鍵を再交換するためTCP接続を閉じます');T='ws_closed';break
 		finally:
 			M.set();g.cancel();h.cancel()
 			for N in(g,h):

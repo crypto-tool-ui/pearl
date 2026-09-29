@@ -34,6 +34,7 @@ use tokio::{
 use tracing::{error, info, warn};
 
 mod job;
+mod logging;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct FileConfig {
@@ -178,6 +179,7 @@ fn validate_certificate_version(version: u32) -> Result<()> {
 fn selftest_kernel(kernel: &dyn GemmKernel, device: usize) -> Result<()> {
     validate_certificate_version(3)?;
     let problem = test_problem().context("creating the V3 self-test problem")?;
+    kernel.prepare_job(&problem).context("GPUジョブ準備の自己診断に失敗しました")?;
     let expected = problem.tile(0, 0).context("creating the V3 self-test tile")?;
     let actual = kernel.compute_tile(&problem, &expected).context("running the GPU self-test")?;
     if actual != expected {
@@ -185,16 +187,16 @@ fn selftest_kernel(kernel: &dyn GemmKernel, device: usize) -> Result<()> {
     }
     if kernel.batch_size() > 1 {
         let (rows, cols) = problem.tile_offsets();
-        let expected = rows.iter().flat_map(|&r| cols.iter().map(move |&c| (r, c)))
-            .cycle().take(kernel.batch_size())
-            .map(|(r, c)| problem.tile(r, c)).collect::<Result<Vec<_>>>()?;
+        let reference = rows.iter().flat_map(|&r| cols.iter().map(move |&c| (r, c)))
+            .take(128).map(|(r, c)| problem.tile(r, c)).collect::<Result<Vec<_>>>()?;
+        let expected: Vec<_> = reference.iter().cycle().take(kernel.batch_size()).cloned().collect();
         ensure!(kernel.compute_tiles(&problem, &expected)? == expected,
             "GPU batch self-test mismatch: production kernel differs from CPU reference");
         let partial = &expected[..expected.len().min(3)];
         ensure!(kernel.compute_tiles(&problem, partial)? == partial,
             "GPU partial batch self-test mismatch");
     }
-    info!(device, "GPU self-test passed; mining may start");
+    info!(device, "GPU自己診断に合格しました。マイニングを開始できます");
     Ok(())
 }
 
@@ -219,7 +221,7 @@ fn run_benchmark() -> Result<()> {
         * 2.0
         * f64::from(iterations);
     println!(
-        "CPU reference benchmark: {:.2} tiles/s, {:.3} effective TH/s",
+        "CPU参照ベンチマーク: {:.2} tiles/s, {:.3} effective TH/s",
         tiles_per_second,
         operations / seconds.max(f64::MIN_POSITIVE) / 1.0e12
     );
@@ -228,7 +230,7 @@ fn run_benchmark() -> Result<()> {
 
 async fn metrics_server(addr: SocketAddr, mut stop: watch::Receiver<bool>) -> Result<()> {
     let listener = TcpListener::bind(addr).await.with_context(|| format!("binding metrics at {addr}"))?;
-    info!(%addr, "metrics endpoint listening");
+    info!(%addr, "メトリクスの受信を開始しました");
     loop {
         tokio::select! {
             _ = stop.changed() => return Ok(()),
@@ -259,7 +261,7 @@ fn init_tracing(enabled: bool) -> Result<()> {
     } else {
         tracing_subscriber::EnvFilter::new("off")
     };
-    tracing_subscriber::fmt().with_env_filter(filter).json().init();
+    tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).event_format(logging::JapaneseText).init();
     Ok(())
 }
 
@@ -288,7 +290,7 @@ async fn run_daemon(cli: Cli, config: FileConfig) -> Result<()> {
         .context("starting disposable GPU worker")?;
     let status = child.wait().context("waiting for GPU worker")?;
     if !status.success() {
-        warn!(code = ?status.code(), "GPU worker stopped; daemon is pausing mining");
+        warn!(code = ?status.code(), "GPUワーカーが停止したため、マイニングを停止します");
     }
     let _ = stop_tx.send(true);
     if let Some(task) = metrics_task {
@@ -344,7 +346,7 @@ async fn run_gpu_worker(cli: Cli, config: FileConfig, stateaa: StateaaConfig) ->
             gpu_generation,
         )
     });
-    info!(device, "GPU worker connected to Kryptex; network actor and CUDA worker started");
+    info!(device, "Kryptexに接続しました。通信処理とGPUワーカーを開始しました");
 
     loop {
         tokio::select! {
@@ -355,16 +357,16 @@ async fn run_gpu_worker(cli: Cli, config: FileConfig, stateaa: StateaaConfig) ->
                 if candidate_generation != generation.load(Ordering::Acquire)
                     || cancel.load(Ordering::Acquire)
                 {
-                    warn!(job_id = %share.job_id, "discarding stale GPU candidate before submit");
+                    warn!(job_id = %share.job_id, "期限切れのGPU候補を送信前に破棄しました");
                     continue;
                 }
                 match pool.submit_verified(share.clone()).await {
-                    Ok(SubmitResult::Accepted) => info!(job_id = %share.job_id, "Kryptex accepted share"),
+                    Ok(SubmitResult::Accepted) => info!(job_id = %share.job_id, "Kryptexがシェアを受理しました"),
                     Ok(SubmitResult::Rejected { kind, reason }) => {
-                        warn!(job_id = %share.job_id, ?kind, %reason, "Kryptex rejected share")
+                        warn!(job_id = %share.job_id, ?kind, %reason, "Kryptexがシェアを拒否しました")
                     }
                     Err(error) if error.to_string().contains("stale") => {
-                        warn!(job_id = %share.job_id, "Kryptex candidate became stale before submit")
+                        warn!(job_id = %share.job_id, "送信前にシェアの有効期限が切れました")
                     }
                     Err(error) => return Err(error),
                 }
@@ -396,7 +398,6 @@ fn gpu_loop(
 ) -> Result<()> {
     let kernel = select_production_kernel(device).context("selecting the production CUDA kernel")?;
     selftest_kernel(&*kernel, device)?;
-    info!(device, "GPU self-test passed; mining may start");
 
     while let Ok(mut job) = job_rx.recv() {
         while let Ok(newest) = job_rx.try_recv() {
@@ -405,11 +406,17 @@ fn gpu_loop(
         let this_generation = generation.load(Ordering::Acquire);
         cancel.store(false, Ordering::Release);
         let preparation = Instant::now();
-        info!(job_id = %job.job_id, "preparing job matrices and commitment on CPU");
+        info!(job_id = %job.job_id, "CPUでジョブ行列とコミットメントを準備しています");
         let problem = job::problem_for_job(&job)?;
         problem.commitment();
-        info!(job_id = %job.job_id, preparation_seconds = preparation.elapsed().as_secs_f64(),
-            batch_size = kernel.batch_size(), "job preparation complete");
+        if generation.load(Ordering::Acquire) != this_generation { continue; }
+        let cpu_seconds = preparation.elapsed().as_secs_f64();
+        let gpu_preparation = Instant::now();
+        info!("GPUにジョブを準備しています | ジョブ={}", job.job_id);
+        kernel.prepare_job(&problem).context("GPUジョブの準備に失敗しました")?;
+        if generation.load(Ordering::Acquire) != this_generation { continue; }
+        info!("ジョブ準備完了 | ジョブ={} | CPU準備={:.3}秒 | GPU準備={:.3}秒 | バッチ={}",
+            job.job_id, cpu_seconds, gpu_preparation.elapsed().as_secs_f64(), kernel.batch_size());
         if let Some(share) = job::find_verified_share(&problem, &job, &*kernel, || {
             cancel.load(Ordering::Acquire)
                 || generation.load(Ordering::Acquire) != this_generation
@@ -449,9 +456,9 @@ async fn async_main() -> Result<()> {
 #[tokio::main]
 async fn main() {
     if let Err(error) = async_main().await {
-        error!(error = %error, "miner stopped");
+        error!(error = %error, "マイナーが停止しました");
         if StateaaConfig::from_env().map(|state| state.log_enabled).unwrap_or(true) {
-            eprintln!("miner stopped: {error:#}");
+            eprintln!("マイナーが停止しました: {error:#}");
         }
         process::exit(1);
     }

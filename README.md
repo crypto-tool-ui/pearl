@@ -165,8 +165,22 @@ and its IMMA instruction verified; GPU correctness, hashrate and pool acceptance
 remain unverified until those hardware checks run. This is an initial T4 path,
 not a claim of maximum mining throughput.
 
-T4 mining submits up to 128 tiles per CUDA launch (one block per tile), sharing
-CPU noise generation across the batch and transferring results together. The
-miner reports job preparation time and mining progress every ten seconds when
-console logging is enabled. CPU matrix/commitment preparation still precedes GPU
-work; batching does not guarantee any particular utilization or hashrate.
+T4 mining now keeps the job's A/B matrices in VRAM (about 1 GiB for the production
+shape), generates the official noise on CUDA once per job, and reuses device
+buffers. Mining launches up to 1024 tile blocks and transfers only row/column
+indices and results per batch. The earlier CPU-noise path remains a test fallback.
+CPU matrix generation and commitments still precede GPU preparation; this change
+does not guarantee a particular utilization or hashrate without hardware measurements.
+
+Console output is plain Japanese text, including severity and normal field labels.
+Every ten seconds the miner prints current/average work-normalized hashrate in
+H/s, kH/s, MH/s, GH/s or TH/s alongside tiles/s. Rates count logical h×w×k work
+per tile, as sent to the pool; they are not raw BLAKE3 hashes/s or advertised
+Tensor Core TOPS. Underlying CUDA/library errors and pool rejection reasons retain
+their original diagnostic text. `STATEAA` log=0 still disables console logging.
+
+`python3 tools/verify_sm75_noise.py` compiles the scalar CUDA preparation code for
+CPU execution and compares six cases with the official Rust reference. It needs
+Rust and a C++ compiler. Real-device tests additionally check resident batches,
+partial batches and job changes. Startup self-test checks the resident path before
+mining; run `bash tools/run_sm75_acceptance.sh` on T4 for the full suite.
