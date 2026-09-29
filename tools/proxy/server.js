@@ -38,7 +38,7 @@ function parsePoolEndpoint(value) {
 
 function connectPool(endpoint) {
   return new Promise((resolve, reject) => {
-    const onConnect = (socket) => {
+    const onConnect = () => {
       socket.setNoDelay(true);
       resolve(socket);
     };
@@ -79,6 +79,10 @@ function relayConnection(miner, endpoint, identityPrivate) {
   };
 
   const attachPool = (candidate) => {
+    if (closed) {
+      candidate.destroy();
+      return;
+    }
     pool = candidate;
     pool.on('data', (chunk) => {
       if (closed) return;
@@ -105,6 +109,7 @@ function relayConnection(miner, endpoint, identityPrivate) {
     const extracted = takeFrames(encryptedPending);
     encryptedPending = extracted.pending;
     for (const frame of extracted.frames) {
+      if (closed) return;
       if (session === null) {
         const hello = serverHello(frame, { identityPrivate, ephemeralPrivate: randomBytes(32) });
         session = hello.session;
