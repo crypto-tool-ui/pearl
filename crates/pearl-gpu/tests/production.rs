@@ -23,6 +23,17 @@ fn production_correctness_and_resident_benchmark() {
     kernel
         .mining_selftest()
         .expect("CPU/GPU production equivalence");
+    if kernel.device_matrix_preparation() {
+        let p = pearl_ref::Problem::from_kryptex_header_attempt_deferred(
+            pearl_ref::test_problem().unwrap().header, 7).unwrap();
+        assert!(!p.a.is_materialized() && !p.bt.is_materialized());
+        kernel.prepare_job(&p).expect("resident generated production matrices");
+        assert!(!p.a.is_materialized() && !p.bt.is_materialized(),
+            "GPU preparation unexpectedly materialized CPU matrices");
+        let tiles = kernel.scan_groups(&p, 0, 1, [255; 32]).unwrap();
+        assert_eq!(tiles.len(), 128);
+        assert_eq!(tiles[0], p.tile(tiles[0].t_rows, tiles[0].t_cols).unwrap());
+    }
     let problem = production_test_problem(8192, 8192, 4096).unwrap();
     let preparation = Instant::now();
     kernel.prepare_job(&problem).unwrap();

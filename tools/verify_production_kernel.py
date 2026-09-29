@@ -14,7 +14,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 helpers = (ROOT / "cuda/sm75_mma.cu").read_text().split("__device__ __forceinline__ void mma_int8")[0] + "\n}\n"
-source = (ROOT / "cuda/production.cu").read_text().replace('#include "sm75_mma.cu"', helpers)
+source = (ROOT / "cuda/production.cu").read_text().split("// Exact stateless form")[0].replace('#include "sm75_mma.cu"', helpers)
 source, replacements = re.subn(
     r'const unsigned address = static_cast<unsigned>\(__cvta_generic_to_shared\(out \+ smem_word\(row, kw\)\)\);\s*'
     r'asm volatile\("cp.async.cg.shared.global[^;]*;"[^;]*;',
@@ -50,11 +50,7 @@ using std::min;
 struct Dim { unsigned x; } blockIdx;
 thread_local Dim threadIdx;
 struct alignas(16) uint4 { uint32_t x,y,z,w; };
-#if __CUDA_ARCH__ < 800
 constexpr unsigned EMU_THREADS = 256;
-#else
-constexpr unsigned EMU_THREADS = 128;
-#endif
 std::barrier cta_barrier(EMU_THREADS);
 std::array<std::unique_ptr<std::barrier<>>,EMU_THREADS/32> warp_barriers;
 struct Fragment { uint32_t a[4],b[2]; } fragments[EMU_THREADS];

@@ -24,7 +24,7 @@ build scripts, runners, binary bundles, or kernel dependencies.
 ## Implementation
 
 All three targets use a 128x128x64 CTA and 128 independent 8x16 proof tiles.
-T4 uses eight 32x64 warp tiles (256 threads), with 64 accumulators per lane.
+All three targets use eight 32x64 warp tiles (256 threads), with 64 accumulators per lane.
 Pairs of warps compute the two 4x16 halves of a proof. Since transcript XOR and
 rotation are linear, their partial transcripts are merged once after the K loop.
 The merge reuses matrix staging memory after the final reader barrier; there is
@@ -32,7 +32,6 @@ no extra barrier at each rank boundary. CUDA 13 compiles this to 128 registers p
 thread with zero spills, using a two-block launch bound (previously 227 registers
 with 128-thread CTAs). Hardware occupancy and speed still require measurement.
 
-H100 and Blackwell retain four 64x64 warp tiles and 128 accumulators per lane.
 Two shared-memory stages use 32 KiB. T4 prefetches 16-byte global loads through
 registers; H100 and Blackwell use cp.async and m16n8k32 rather than T4's m8n8k16.
 The H100 path is MMA, not WGMMA; no peak-performance claim is made.
@@ -44,8 +43,8 @@ fail explicitly. The small-tile APIs remain available for oracle tests.
 
 A/B and their noise stay resident for an attempt. The device computes tile indices
 from a banded raster; the CPU no longer allocates and transfers row/column arrays
-for every mining batch. Launch size is sixteen CTAs per SM on T4 and four on H100/Blackwell, bounded
-to 32..4096 CTAs. The larger T4 batch amortizes counter readback and launch costs;
+for every mining batch. Launch size is sixteen CTAs per SM, bounded
+to 32..4096 CTAs. The larger batch amortizes counter readback and launch costs;
 band height is 4 on T4 and 8 on H100/Blackwell. These are initial bounded defaults,
 not device-measured autotuning results.
 
@@ -60,24 +59,35 @@ after shares and derives fresh matrix seeds after exhausting an attempt without
 changing the pool header. Generation tags travel with jobs; stale candidates are
 checked before proof construction and again before submission.
 
-Matrix generation and commitment hashing run on a dedicated CPU worker with one
-attempt of lookahead, overlapping the current GPU scan. The first attempt still
-pays the full preparation cost. Logs distinguish CPU preparation duration from
-CPU wait time; whole-attempt hashrate includes the actual wait and GPU preparation,
-without counting overlapped CPU work twice. Stale prepared attempts are discarded.
-This uses approximately one additional GiB of matrix RAM, plus hashing scratch.
+On H100 and RTX PRO 6000 Blackwell, deterministic matrix recipes are generated
+on the GPU using the exact SplitMix word/byte contract from the CPU reference.
+Keyed BLAKE3 roots are reduced on the same device buffers before noise is applied
+in place. Only the two 32-byte roots return to the CPU for seed derivation; no
+1 GiB host allocation or matrix upload occurs per attempt. The CPU matrix storage
+is lazy and shared: the proof worker regenerates the exact original bytes only
+when a candidate needs an official proof. Stale unused recipes cost no matrix RAM.
+The GPU hash parent block length is 64 bytes (two 32-byte CVs); CPU-source tests
+cover this explicitly, fixing a previously unused device-hash implementation bug.
 
-Matrix generation and commitment hashing still run on the CPU, and Merkle proof
-construction remains a CPU cost. These can limit whole-miner throughput on fast
-GPUs even when scan throughput improves. Queued proof tasks retain their matrix
-allocation until verified/discarded; RAM demand can exceed the ~1 GiB current
-attempt. This implementation does not claim full GPU job preparation or persistent
-cross-job execution.
+T4 retains CPU preparation with one-attempt lookahead. Logs distinguish CPU
+preparation time from CPU wait time; the reported average includes actual wait
+and GPU setup. Device setup is currently sequential with scan, not double buffered
+on the GPU. Merkle proof construction remains on the CPU and can cost seconds on
+a share hit, while scanning continues via the bounded proof queue.
+
+The requested 420 TH/s (RTX PRO 6000) and 700 TH/s (H100) are performance targets,
+not measured results. B200 SM100 TMEM/two-SM kernels cannot be reused as SM120
+kernels. H100 still uses the verified MMA path; this change does not introduce a
+WGMMA or persistent TMA kernel. Benchmark scan throughput and live total throughput
+separately before drawing performance conclusions.
 
 ## Validation and limits
 
 - `cargo test --locked`: CPU reference, scan continuation/cancellation, proof-queue
   error propagation, seed rotation, and protocol tests.
+- `python3 tools/verify_device_setup.py`: runs actual CUDA generator and hash
+  source on the CPU against Rust vectors for 1, 2, 3, 17 and 512 chunks, including
+  seed wraparound, byte packing and Merkle root flags.
 - `python3 tools/verify_production_kernel.py`: executes the actual CUDA source
   control flow using CPU-emulated PTX fragments. Checks all lanes against scalar
   matrix multiplication at K=128, K=2176 and K=4096, staging, transcript wrap/rotation,

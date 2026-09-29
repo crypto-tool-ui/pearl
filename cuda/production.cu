@@ -1,6 +1,5 @@
 // Dense V3 mining: one 128x128 CTA contains 128 independent 8x16 proof tiles.
-// T4 splits each proof across two warps and merges their linear transcripts once.
-// Newer architectures retain one complete proof per lane.
+// Each proof is split across two warps, merging their linear transcripts once.
 // sm75: m8n8k16 and register-prefetched loads; sm90/sm120: m16n8k32 + cp.async.
 // Written against the existing Pearl fragment contract; no third-party kernel code.
 #define PEARL_PORTABLE_MMA 1
@@ -8,11 +7,7 @@
 
 namespace {
 constexpr unsigned BM = 128, BN = 128, BK = 64;
-#if __CUDA_ARCH__ < 800
 constexpr unsigned THREADS = 256, ACC_ROWS = 4;
-#else
-constexpr unsigned THREADS = 128, ACC_ROWS = 8;
-#endif
 constexpr unsigned LOADS = (BM + BN) * BK / 16 / THREADS;
 constexpr unsigned WORDS = (BM + BN) * BK / 4;
 constexpr unsigned RECORD_WORDS = 26;
@@ -61,13 +56,8 @@ __device__ __forceinline__ void stage_ready(uint32_t* out, const uint4 (&prefetc
 }
 }
 
-#if __CUDA_ARCH__ < 800
 #define PRODUCTION_THREADS 256
 #define PRODUCTION_BLOCKS 2
-#else
-#define PRODUCTION_THREADS 128
-#define PRODUCTION_BLOCKS 1
-#endif
 extern "C" __global__ __launch_bounds__(PRODUCTION_THREADS, PRODUCTION_BLOCKS)
 void pearl_production_scan(const int8_t* a, const int8_t* bt,
     unsigned m, unsigned n, unsigned k, unsigned rank,
@@ -97,9 +87,9 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
 #if __CUDA_ARCH__ >= 800
 #pragma unroll
     for (unsigned sk = 0; sk < BK; sk += 32) {
-      uint32_t af[4][4], bf[8][2];
+      uint32_t af[2][4], bf[8][2];
 #pragma unroll
-      for (unsigned i = 0; i < 4; ++i) {
+      for (unsigned i = 0; i < 2; ++i) {
         af[i][0] = operand(s, wr + i * 16 + group, sk + pair * 4);
         af[i][1] = operand(s, wr + i * 16 + group + 8, sk + pair * 4);
         af[i][2] = operand(s, wr + i * 16 + group, sk + pair * 4 + 16);
@@ -111,7 +101,7 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
         bf[j][1] = operand(s, BM + wc + j * 8 + group, sk + pair * 4 + 16);
       }
 #pragma unroll
-      for (unsigned i = 0; i < 4; ++i)
+      for (unsigned i = 0; i < 2; ++i)
 #pragma unroll
         for (unsigned j = 0; j < 8; ++j)
           asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -162,7 +152,6 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
     for (int i = 15; i > 0; --i) transcript[i] = transcript[i - 1];
     transcript[0] = last;
   }
-#if __CUDA_ARCH__ < 800
   // XOR and rotation are linear: merging the two 4x16 transcripts here gives
   // exactly the original 8x16 transcript, without a barrier at each milestone.
   // All matrix readers finished at the final loop barrier. Reuse stage storage.
@@ -176,7 +165,6 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
 #pragma unroll
   for (unsigned i = 0; i < 16; ++i)
     transcript[i] ^= stages[0][threadIdx.x * 16 + i];
-#endif
   uint8_t digest[32];
   blake3_jackpot_hash(transcript, seed, digest);
   bool wins = true;
@@ -197,4 +185,22 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
       for (unsigned i = 0; i < 8; ++i) dst[18+i] = load_u32_le(digest + i*4);
     }
   }
+}
+
+// Exact stateless form of pearl_ref::fill_int7: one SplitMix word per thread.
+extern "C" __global__ void pearl_generate_matrix(
+    uint64_t seed, uint64_t domain, unsigned words, uint64_t* out) {
+  const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= words) return;
+  uint64_t x = (seed ^ domain) + (uint64_t(i) + 1) * 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  uint64_t packed = 0;
+#pragma unroll
+  for (unsigned j = 0; j < 8; ++j) {
+    uint8_t value = uint8_t(int((x >> (j * 8)) & 127) - 64);
+    packed |= uint64_t(value) << (j * 8);
+  }
+  out[i] = packed;
 }

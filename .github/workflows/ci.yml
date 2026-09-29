@@ -32,6 +32,8 @@ jobs:
         run: cargo test --locked
       - name: Check production kernel arithmetic with CPU fragment emulation
         run: python3 tools/verify_production_kernel.py
+      - name: Check device matrix generation and commitment arithmetic
+        run: python3 tools/verify_device_setup.py
       - uses: actions/setup-node@v4
         with:
           node-version: 20

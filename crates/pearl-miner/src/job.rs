@@ -9,7 +9,7 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 /// Builds the committed V3 work unit from the exact 76-byte header sent by Kryptex.
-pub fn problem_for_job(job: &PoolJob, attempt: u64) -> Result<Problem> {
+pub fn problem_for_job_mode(job: &PoolJob, attempt: u64, deferred: bool) -> Result<Problem> {
     ensure!(
         !job.requires_update(),
         "update required: unsupported certificate version"
@@ -17,7 +17,8 @@ pub fn problem_for_job(job: &PoolJob, attempt: u64) -> Result<Problem> {
     let header = IncompleteBlockHeader::from_bytes(&job.header)
         .context("decoding Kryptex IncompleteBlockHeader")?;
     ensure!(header.nbits != 0, "Kryptex job has zero block target");
-    Problem::from_kryptex_header_attempt(header, attempt)
+    if deferred { Problem::from_kryptex_header_attempt_deferred(header, attempt) }
+    else { Problem::from_kryptex_header_attempt(header, attempt) }
 }
 
 /// Scans the fixed Kryptex tile partition with the selected production kernel.

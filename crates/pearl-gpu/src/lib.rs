@@ -67,6 +67,7 @@ pub struct KernelMetadata {
 
 /// Common interface for per-architecture, per-precision GEMM implementations.
 pub trait GemmKernel {
+    fn device_matrix_preparation(&self) -> bool { false }
     fn metadata(&self) -> KernelMetadata;
     fn compute_tile(&self, problem: &Problem, tile: &TileResult) -> Result<TileResult>;
     fn prepare_job(&self, _problem: &Problem) -> Result<()> { Ok(()) }

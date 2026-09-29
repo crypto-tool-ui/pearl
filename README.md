@@ -186,13 +186,16 @@ Without a GPU, validate source arithmetic and cubins with:
 
 ```sh
 python3 tools/verify_production_kernel.py
+python3 tools/verify_device_setup.py
 bash tools/check_production_sass.sh
 ```
 
 The grouped path has CPU arithmetic and compilation checks. GPU correctness,
 sustained throughput and pool acceptance require the hardware checks above;
-no target hashrate is guaranteed. CPU matrix generation, commitment hashing
-and proof work remain potential bottlenecks. See [implementation and validation
+no target hashrate is guaranteed. Blackwell/H100 generate matrices, hash commitments
+and apply noise on the GPU; CPU matrices are regenerated only for candidate proofs.
+T4 retains CPU preparation with one-attempt lookahead. CPU proof work remains a
+potential bottleneck. See [implementation and validation
 notes](docs/production-gpu.md) for references, constraints and test coverage.
 
 Console hashrates use logical `h × w × k` MAC/s: 1 TH/s = 10¹² MAC/s. Current

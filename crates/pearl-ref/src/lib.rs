@@ -35,6 +35,34 @@ pub const KRYPTEX_COLS: [u32; 16] = [
     0, 1, 8, 9, 16, 17, 24, 25, 32, 33, 40, 41, 48, 49, 56, 57,
 ];
 
+/// Immutable matrix, optionally regenerated only when a CPU proof needs it.
+#[derive(Clone, Debug)]
+pub struct Matrix {
+    values: Arc<OnceLock<Vec<i8>>>,
+    recipe: Option<(u64, u64, usize)>,
+}
+impl Matrix {
+    pub fn generated(seed: u64, domain: u64, len: usize) -> Self {
+        Self { values: Arc::new(OnceLock::new()), recipe: Some((seed, domain, len)) }
+    }
+    pub fn recipe(&self) -> Option<(u64, u64, usize)> { self.recipe }
+    pub fn is_materialized(&self) -> bool { self.values.get().is_some() }
+}
+impl From<Vec<i8>> for Matrix {
+    fn from(values: Vec<i8>) -> Self {
+        Self { values: Arc::new(OnceLock::from(values)), recipe: None }
+    }
+}
+impl std::ops::Deref for Matrix {
+    type Target = [i8];
+    fn deref(&self) -> &[i8] {
+        self.values.get_or_init(|| {
+            let (seed, domain, len) = self.recipe.expect("matrix recipe");
+            fill_int7(seed, domain, len)
+        })
+    }
+}
+
 /// The committed inputs to one dense V3 proof-of-useful-work job.
 #[derive(Clone, Debug)]
 pub struct Problem {
@@ -43,9 +71,9 @@ pub struct Problem {
     pub m: u32,
     pub n: u32,
     /// A, row-major, with `m * k` entries.
-    pub a: Vec<i8>,
+    pub a: Matrix,
     /// B transpose, row-major, with `n * k` entries.
-    pub bt: Vec<i8>,
+    pub bt: Matrix,
     commitment_cache: Arc<OnceLock<Commitment>>,
 }
 
@@ -85,6 +113,14 @@ impl Problem {
     /// Independent committed matrices for subsequent scans of the same pool header.
     /// The attempt is local seed material, never a modification of the pool header.
     pub fn from_kryptex_header_attempt(header: IncompleteBlockHeader, attempt: u64) -> Result<Self> {
+        let problem = Self::from_kryptex_header_attempt_deferred(header, attempt)?;
+        let _ = &*problem.a;
+        let _ = &*problem.bt;
+        Ok(problem)
+    }
+
+    /// Deterministic matrix recipes for device generation; CPU bytes are deferred until proof.
+    pub fn from_kryptex_header_attempt_deferred(header: IncompleteBlockHeader, attempt: u64) -> Result<Self> {
         let config = MiningConfiguration {
             common_dim: KRYPTEX_K,
             rank: KRYPTEX_RANK,
@@ -98,9 +134,10 @@ impl Problem {
         key_material.extend_from_slice(&config.to_bytes());
         let job_key = blake3::hash(&key_material);
         let seed = matrix_attempt_seed(job_key.as_bytes(), attempt);
-        let a = fill_int7(seed, KRYPTEX_DOMAIN_A, KRYPTEX_M as usize * KRYPTEX_K as usize);
-        let bt = fill_int7(seed, KRYPTEX_DOMAIN_BT, KRYPTEX_N as usize * KRYPTEX_K as usize);
-        Self::new(header, config, KRYPTEX_M, KRYPTEX_N, a, bt)
+        let a = Matrix::generated(seed, KRYPTEX_DOMAIN_A, KRYPTEX_M as usize * KRYPTEX_K as usize);
+        let bt = Matrix::generated(seed, KRYPTEX_DOMAIN_BT, KRYPTEX_N as usize * KRYPTEX_K as usize);
+        Ok(Self { header, config, m: KRYPTEX_M, n: KRYPTEX_N, a, bt,
+            commitment_cache: Arc::new(OnceLock::new()) })
     }
 
     /// Returns row/column offsets without computing the tile transcript.
@@ -142,13 +179,18 @@ impl Problem {
 
     /// Creates a dense V3 problem and checks only structural facts that are independent of a job
     /// verifier. The official verifier remains authoritative for consensus validity.
-    pub fn new(
+    pub fn new(header: IncompleteBlockHeader, config: MiningConfiguration, m: u32, n: u32,
+        a: Vec<i8>, bt: Vec<i8>) -> Result<Self> {
+        Self::new_matrices(header, config, m, n, a.into(), bt.into())
+    }
+
+    pub fn new_matrices(
         header: IncompleteBlockHeader,
         config: MiningConfiguration,
         m: u32,
         n: u32,
-        a: Vec<i8>,
-        bt: Vec<i8>,
+        a: Matrix,
+        bt: Matrix,
     ) -> Result<Self> {
         ensure!(
             config.moe.is_none(),
@@ -190,6 +232,13 @@ impl Problem {
                 let job_key = self.job_key();
                 let root_a = keyed_matrix_root(&self.a, job_key);
                 let root_b = keyed_matrix_root(&self.bt, job_key);
+                self.commitment_from_roots(root_a, root_b)
+            })
+            .clone()
+    }
+
+    fn commitment_from_roots(&self, root_a: Hash256, root_b: Hash256) -> Commitment {
+        let job_key = self.job_key();
                 let bound_a = bind_root_a(&root_a, self.m);
                 let bound_b = bind_root_b(&root_b, self.n);
                 let b_noise_seed =
@@ -205,8 +254,15 @@ impl Problem {
                     b_noise_seed,
                     a_noise_seed,
                 }
-            })
-            .clone()
+    }
+
+    /// Installs accelerator roots. Device setup must pass CPU comparison at startup;
+    /// submitted proofs still pass the independent official CPU verifier.
+    pub fn install_accelerated_roots(&self, root_a: Hash256, root_b: Hash256) -> Result<()> {
+        let commitment = self.commitment_from_roots(root_a, root_b);
+        let cached = self.commitment_cache.get_or_init(|| commitment.clone());
+        ensure!(*cached == commitment, "accelerator commitment conflicts with cached roots");
+        Ok(())
     }
 
     /// Compact official noise permutations used by the resident GPU preparation path.
@@ -538,10 +594,10 @@ pub fn test_problem() -> Result<Problem> {
         timestamp: 0x6666_6666,
         nbits: 0x207f_ffff,
     };
-    let a = (0..m as usize * k as usize)
+    let a: Vec<i8> = (0..m as usize * k as usize)
         .map(|i| (((i * 13 + 7) % 129) as i32 - 64) as i8)
         .collect();
-    let bt = (0..n as usize * k as usize)
+    let bt: Vec<i8> = (0..n as usize * k as usize)
         .map(|i| (((i * 17 + 3) % 129) as i32 - 64) as i8)
         .collect();
     Problem::new(header, config, m, n, a, bt)
@@ -558,8 +614,8 @@ pub fn test_header_variant(problem: &Problem, timestamp: u32) -> Result<Problem>
         problem.config,
         problem.m,
         problem.n,
-        problem.a.clone(),
-        problem.bt.clone(),
+        problem.a.to_vec(),
+        problem.bt.to_vec(),
     )
 }
 
@@ -700,5 +756,41 @@ mod tests {
             tile.digest,
             compute_jackpot_hash(&tile.transcript, problem.commitment().a_noise_seed)
         );
+    }
+}
+
+#[cfg(test)]
+mod deferred_matrix_tests {
+    use super::*;
+    #[test]
+    fn deferred_matrix_matches_eager_bytes_and_shares_storage() {
+        for len in [1, 7, 8, 9, 1024, 4097] {
+            let matrix = Matrix::generated(u64::MAX, 0x123456789abcdef0, len);
+            let clone = matrix.clone();
+            assert!(!matrix.is_materialized());
+            assert_eq!(&*matrix, fill_int7(u64::MAX, 0x123456789abcdef0, len));
+            assert!(clone.is_materialized());
+            assert_eq!(matrix.as_ptr(), clone.as_ptr());
+        }
+    }
+    #[test]
+    fn deferred_production_attempts_do_not_allocate_host_matrices() {
+        let header = test_problem().unwrap().header;
+        let first = Problem::from_kryptex_header_attempt_deferred(header.clone(), 0).unwrap();
+        let next = Problem::from_kryptex_header_attempt_deferred(header, 1).unwrap();
+        assert!(!first.a.is_materialized() && !first.bt.is_materialized());
+        assert!(!next.a.is_materialized() && !next.bt.is_materialized());
+        assert_ne!(first.a.recipe(), next.a.recipe());
+        assert_ne!(first.a.recipe(), first.bt.recipe());
+    }
+    #[test]
+    fn accelerator_roots_cannot_replace_an_existing_commitment() {
+        let problem = test_problem().unwrap();
+        let expected = problem.commitment();
+        problem.install_accelerated_roots(expected.root_a, expected.root_b).unwrap();
+        let mut wrong = expected.root_a;
+        wrong[0] ^= 1;
+        assert!(problem.install_accelerated_roots(wrong, expected.root_b).is_err());
+        assert_eq!(problem.commitment(), expected);
     }
 }

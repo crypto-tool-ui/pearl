@@ -132,7 +132,7 @@ __device__ __forceinline__ void parent_hash(
   key_words(key, cv);
   for (uint32_t i = 0; i < 8; ++i) message[i] = load32(left + i * 4);
   for (uint32_t i = 0; i < 8; ++i) message[i + 8] = load32(right + i * 4);
-  compress(cv, message, 0, kDigestBytes,
+  compress(cv, message, 0, kBlockBytes,
            kKeyedHash | kParent | (root_output ? kRoot : 0), state);
   for (uint32_t i = 0; i < 8; ++i) store32(output + i * 4, state[i] ^ state[i + 8]);
 }

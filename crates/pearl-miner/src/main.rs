@@ -238,7 +238,12 @@ fn run_gpu_benchmark(device: usize) -> Result<()> {
     selftest_kernel(&*kernel, device)?;
     info!(device, "本番サイズのGPUベンチマークを準備しています");
     let preparation = Instant::now();
-    let problem = pearl_ref::Problem::from_kryptex_header(test_problem()?.header)?;
+    let header = test_problem()?.header;
+    let problem = if kernel.device_matrix_preparation() {
+        pearl_ref::Problem::from_kryptex_header_attempt_deferred(header, 0)?
+    } else {
+        pearl_ref::Problem::from_kryptex_header(header)?
+    };
     kernel.prepare_job(&problem)?;
     let prep_seconds = preparation.elapsed().as_secs_f64();
     let (groups, batch) = kernel.mining_groups(&problem)?.context("grouped kernel unavailable")?;
@@ -498,14 +503,15 @@ fn gpu_loop(
                 let prep_generation = generation.clone();
                 let prep_cancel = cancel.clone();
                 let prep_job = job.clone();
+                let device_prep = kernel.device_matrix_preparation();
                 let prefetch = prefetch::Prefetch::new(move |attempt| -> Result<Option<(Arc<pearl_ref::Problem>, f64)>> {
                     let current = || !prep_cancel.load(Ordering::Acquire)
                         && prep_generation.load(Ordering::Acquire) == this_generation;
                     if !current() { return Ok(None); }
                     let started = Instant::now();
-                    let problem = Arc::new(job::problem_for_job(&prep_job, attempt)?);
+                    let problem = Arc::new(job::problem_for_job_mode(&prep_job, attempt, device_prep)?);
                     if !current() { return Ok(None); }
-                    problem.commitment();
+                    if !device_prep { problem.commitment(); }
                     if !current() { return Ok(None); }
                     Ok(Some((problem, started.elapsed().as_secs_f64())))
                 });

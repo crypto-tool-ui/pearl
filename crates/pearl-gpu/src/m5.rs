@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use cudarc::driver::{
-    result, sys, CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
+    result, sys, CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr,
 };
 use pearl_ref::{bind_root_a, bind_root_b, Commitment, Problem};
 use serde::{Deserialize, Serialize};
@@ -66,11 +66,18 @@ impl TensorHashCudaKernel {
             data.len().is_multiple_of(BLAKE3_CHUNK_BYTES),
             "tensor_hash input must be padded to 1024 bytes"
         );
-        let chunk_count = data.len() / BLAKE3_CHUNK_BYTES;
-        ensure!(chunk_count <= u32::MAX as usize, "tensor_hash input has too many chunks");
-
         let stream = self.context.new_stream().context("creating tensor_hash stream")?;
         let d_data = stream.clone_htod(data).context("uploading tensor_hash input")?;
+        self.hash_device(&stream, &d_data, key)
+    }
+
+    /// Hashes resident byte elements without a host staging copy.
+    pub fn hash_device<T: DeviceRepr>(&self, stream: &Arc<CudaStream>, d_data: &CudaSlice<T>, key: [u8; 32]) -> Result<[u8; 32]> {
+        ensure!(std::mem::size_of::<T>() == 1, "tensor_hash expects byte elements");
+        ensure!(!d_data.is_empty() && d_data.len() % BLAKE3_CHUNK_BYTES == 0,
+            "tensor_hash device input must be nonempty and chunk aligned");
+        let chunk_count = d_data.len() / BLAKE3_CHUNK_BYTES;
+        ensure!(chunk_count <= u32::MAX as usize, "tensor_hash input has too many chunks");
         let d_key = stream.clone_htod(&key).context("uploading tensor_hash key")?;
         let mut d_level = stream
             .alloc_zeros::<u8>(chunk_count * BLAKE3_DIGEST_BYTES)
@@ -138,10 +145,10 @@ impl TensorHashCudaKernel {
         self.hash_padded(&bytes, key)
     }
 
-    fn launch_leaf(
+    fn launch_leaf<T: DeviceRepr>(
         &self,
         stream: &Arc<CudaStream>,
-        data: &CudaSlice<u8>,
+        data: &CudaSlice<T>,
         key: &CudaSlice<u8>,
         chunk_count: u32,
         root_output: u32,

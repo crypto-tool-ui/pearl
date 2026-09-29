@@ -488,7 +488,7 @@ impl ProductionCudaKernel {
         let groups_per_launch = u32::try_from(
             context.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         )?
-        .saturating_mul(if architecture == KernelArchitecture::Sm75Mma { 16 } else { 4 })
+        .saturating_mul(16)
         .clamp(32, 4096);
         let scan = load_cuda_kernel(&context, cubin, "pearl_production_scan")?;
         let stream = context.default_stream();
@@ -560,7 +560,7 @@ impl ProductionCudaKernel {
                 result::launch_kernel(
                     self.scan.function,
                     (groups, 1, 1),
-                    (if self.architecture == KernelArchitecture::Sm75Mma { 256 } else { 128 }, 1, 1),
+                    (256, 1, 1),
                     0,
                     stream.cu_stream(),
                     &mut args,
@@ -616,8 +616,13 @@ impl GemmKernel for ProductionCudaKernel {
             certificate_version: 3,
         }
     }
+    fn device_matrix_preparation(&self) -> bool {
+        self.architecture != KernelArchitecture::Sm75Mma
+    }
     fn prepare_job(&self, p: &Problem) -> Result<()> {
-        self.base.prepare_job(p)
+        self.base.resident.borrow_mut().take();
+        *self.base.resident.borrow_mut() = Some(self.base.prepare_resident_mode(p, self.device_matrix_preparation())?);
+        Ok(())
     }
     fn batch_size(&self) -> usize {
         self.base.batch_size()
@@ -714,6 +719,18 @@ impl GemmKernel for ProductionCudaKernel {
                 "production zero target mismatch"
             );
         }
+        if self.device_matrix_preparation() {
+            let fixture = production_test_problem(128, 128, 4096)?;
+            let p = Problem::new_matrices(fixture.header, fixture.config.clone(), 128, 128,
+                pearl_ref::Matrix::generated(0x123456789abcdef0, 7, 128 * 4096),
+                pearl_ref::Matrix::generated(0x123456789abcdef0, 13, 128 * 4096))?;
+            let expected = p.commitment();
+            self.prepare_job(&p)?; // refuses roots differing from CPU cache
+            ensure!(p.commitment() == expected, "GPU generated commitment mismatch");
+            for tile in self.scan_groups(&p, 0, 1, [255; 32])? {
+                ensure!(tile == p.tile(tile.t_rows, tile.t_cols)?, "GPU generated tile mismatch");
+            }
+        }
         self.base.resident.borrow_mut().take();
         Ok(())
     }
@@ -731,10 +748,10 @@ pub fn production_test_problem(m: u32, n: u32, k: u32) -> Result<Problem> {
         rows_pattern: PeriodicPattern::from_list(&KRYPTEX_ROWS)?,
         cols_pattern: PeriodicPattern::from_list(&KRYPTEX_COLS)?,
     };
-    let a = (0..m as usize * k as usize)
+    let a: Vec<i8> = (0..m as usize * k as usize)
         .map(|i| (((i * 13 + 7) % 129) as i32 - 64) as i8)
         .collect();
-    let bt = (0..n as usize * k as usize)
+    let bt: Vec<i8> = (0..n as usize * k as usize)
         .map(|i| (((i * 17 + 3) % 129) as i32 - 64) as i8)
         .collect();
     Problem::new(header, config, m, n, a, bt)
@@ -754,6 +771,10 @@ struct ResidentJob {
 
 impl MmaSm75CudaKernel {
     fn prepare_resident(&self, problem: &Problem) -> Result<ResidentJob> {
+        self.prepare_resident_mode(problem, false)
+    }
+
+    fn prepare_resident_mode(&self, problem: &Problem, device_setup: bool) -> Result<ResidentJob> {
         ensure!(
             problem.config.mma_type == MMAType::Int7xInt7ToInt32 && problem.config.moe.is_none(),
             "T4 requires dense V3 INT7 inputs"
@@ -767,20 +788,47 @@ impl MmaSm75CudaKernel {
         let cubin = self.cubin;
         let uniform_kernel = load_cuda_kernel(&self.context, cubin, "pearl_sm75_uniform")?;
         let noise_kernel = load_cuda_kernel(&self.context, cubin, "pearl_sm75_apply_noise")?;
+        let upload = |matrix: &pearl_ref::Matrix, expected_len: usize| -> Result<CudaSlice<i8>> {
+            if device_setup {
+                if let Some((seed, domain, len)) = matrix.recipe() {
+                    ensure!(len == expected_len && len % 8 == 0, "invalid GPU matrix recipe length");
+                    let generator = load_cuda_kernel(&self.context, cubin, "pearl_generate_matrix")?;
+                    let mut data = stream.alloc_zeros::<i8>(len)?;
+                    let words = u32::try_from(len / 8)?;
+                    {
+                        let (out, _guard) = data.device_ptr_mut(&stream);
+                        let mut args = [param(&seed), param(&domain), param(&words), param(&out)];
+                        unsafe { result::launch_kernel(generator.function,
+                            (words.div_ceil(256), 1, 1), (256, 1, 1), 0,
+                            stream.cu_stream(), &mut args)?; }
+                    }
+                    stream.synchronize()?;
+                    return Ok(data);
+                }
+            }
+            Ok(stream.clone_htod(&**matrix)?)
+        };
+        let a = upload(&problem.a, problem.m as usize * problem.k())?;
+        let bt = upload(&problem.bt, problem.n as usize * problem.k())?;
+        if device_setup {
+            let hash = crate::m5::TensorHashCudaKernel::from_context(self.context.clone())?;
+            let root_a = hash.hash_device(&stream, &a, problem.job_key())?;
+            let root_b = hash.hash_device(&stream, &bt, problem.job_key())?;
+            problem.install_accelerated_roots(root_a, root_b)?;
+        }
         let commitment = problem.commitment();
         let (permutation_a, permutation_b) = problem.noise_permutations();
-        let prepare = |matrix: &[i8],
+        let prepare = |mut data: CudaSlice<i8>,
                        seed: &[u8; 32],
                        permutation: &[u32],
                        is_b: u32|
          -> Result<CudaSlice<i8>> {
-            let cells = u32::try_from(matrix.len()).context("T4 matrix exceeds u32 indexing")?;
+            let cells = u32::try_from(data.len()).context("T4 matrix exceeds u32 indexing")?;
             let k = u32::try_from(problem.k())?;
-            let uniform_len = (matrix.len() / problem.k())
+            let uniform_len = (data.len() / problem.k())
                 .checked_mul(rank as usize)
                 .context("noise size overflow")?;
             let blocks = u32::try_from(uniform_len / 32)?;
-            let mut data = stream.clone_htod(matrix)?;
             let mut uniform = stream.alloc_zeros::<i8>(uniform_len)?;
             let d_seed = stream.clone_htod(seed)?;
             let d_permutation = stream.clone_htod(permutation)?;
@@ -825,8 +873,8 @@ impl MmaSm75CudaKernel {
             stream.synchronize()?;
             Ok(data)
         };
-        let a = prepare(&problem.a, &commitment.a_noise_seed, &permutation_a, 0)?;
-        let bt = prepare(&problem.bt, &commitment.b_noise_seed, &permutation_b, 1)?;
+        let a = prepare(a, &commitment.a_noise_seed, &permutation_a, 0)?;
+        let bt = prepare(bt, &commitment.b_noise_seed, &permutation_b, 1)?;
         let tile = problem.empty_tile(0, 0)?;
         Ok(ResidentJob {
             key: commitment.a_noise_seed,
