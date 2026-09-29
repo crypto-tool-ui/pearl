@@ -42,6 +42,12 @@ async def main():
                 except ValueError:
                     request = {}
                 if isinstance(request, dict) and request.get('method') in ('mining.subscribe', 'mining.authorize'):
+                    if request['method'] == 'mining.authorize':
+                        if request.get('params', {}).get('password') != 'd=2097152':
+                            writer.write((json.dumps({'id': request['id'], 'result': False,
+                                                      'error': 'password did not reach backend'}) + '\n').encode())
+                            await writer.drain()
+                            continue
                     writer.write((json.dumps({'id': request['id'], 'result': True, 'error': None}) + '\n').encode())
                     if request['method'] == 'mining.authorize':
                         job = {'method': 'mining.notify', 'params': {'job_id': 'integration_1',

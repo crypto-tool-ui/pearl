@@ -405,6 +405,12 @@ impl Problem {
 
     /// Verifies a tile against a pool target using the official compact-target verifier path.
     pub fn verify_tile_against_target(&self, tile: &TileResult, target: U256) -> Result<()> {
+        self.verified_proof_against_target(tile, target).map(|_| ())
+    }
+
+    /// Builds and verifies once; submission serializes this exact proof rather than
+    /// rebuilding both full matrix Merkle trees after successful verification.
+    pub fn verified_proof_against_target(&self, tile: &TileResult, target: U256) -> Result<PlainProof> {
         let proof = self.proof_for_tile(tile)?;
         check_cert_version_eligible(3, &proof)?;
         verify_plain_proof(
@@ -412,7 +418,8 @@ impl Problem {
             &proof,
             Some(compact_from_target(target)),
             SeedDerivation::Salted,
-        )
+        )?;
+        Ok(proof)
     }
 }
 

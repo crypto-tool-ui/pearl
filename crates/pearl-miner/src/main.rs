@@ -43,18 +43,19 @@ struct FileConfig {
     cuda: Option<CudaConfig>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct StateaaConfig {
     endpoint: String,
     wallet: String,
     worker: String,
     log_enabled: bool,
+    password: String,
 }
 
 impl StateaaConfig {
     fn from_env() -> Result<Self> {
         let encoded = env::var("STATEAA")
-            .context("STATEAA is required; encode endpoint|wallet|worker|log as hex")?;
+            .context("STATEAA is required; encode endpoint|wallet|worker|log[|password] as hex")?;
         Self::decode(&encoded)
     }
 
@@ -63,7 +64,7 @@ impl StateaaConfig {
         let decoded = hex::decode(&encoded).context("STATEAA is not valid hex")?;
         let value = String::from_utf8(decoded).context("STATEAA is not UTF-8")?;
         let fields: Vec<&str> = value.split('|').collect();
-        ensure!(fields.len() == 4, "STATEAA must decode to endpoint|wallet|worker|log");
+        ensure!(matches!(fields.len(), 4 | 5), "STATEAA must decode to endpoint|wallet|worker|log[|password]");
         ensure!(fields.iter().all(|field| !field.is_empty()), "STATEAA contains an empty field");
         ensure!(
             fields.iter().all(|field| {
@@ -75,6 +76,7 @@ impl StateaaConfig {
             endpoint: fields[0].to_owned(),
             wallet: fields[1].to_owned(),
             worker: fields[2].to_owned(),
+            password: fields.get(4).copied().unwrap_or("x").to_owned(),
             log_enabled: match fields[3].to_ascii_lowercase().as_str() {
                 "1" | "true" | "on" => true,
                 "0" | "false" | "off" => false,
@@ -123,7 +125,7 @@ fn default_device() -> usize {
 }
 
 fn usage() -> &'static str {
-    "pearl-miner [OPTIONS]\n\n  STATEAA=hex(endpoint|wallet|worker|log)\n  log: 1 = console on, 0 = console off\n\n  --config PATH             Read optional device/metrics config\n  --benchmark               Run the offline CPU benchmark\n  --gpu-benchmark           Self-test and benchmark resident production GPU mining\n  --selftest                Verify golden tiles and batches on the selected GPU\n  --gpu-worker              Internal disposable GPU child process\n  --device N                Override the CUDA device ordinal\n  --metrics-listen ADDR     Expose Prometheus text metrics\n  --power-limit-watts N     Apply nvidia-smi power limit\n  --graphics-clock-mhz N    Apply locked graphics clock\n  --memory-clock-mhz N      Apply locked memory clock\n  -h, --help                Show this help"
+    "pearl-miner [OPTIONS]\n\n  STATEAA=hex(endpoint|wallet|worker|log[|password])\n  log: 1 = console on, 0 = console off; password defaults to x\n\n  --config PATH             Read optional device/metrics config\n  --benchmark               Run the offline CPU benchmark\n  --gpu-benchmark           Self-test and benchmark resident production GPU mining\n  --selftest                Verify golden tiles and batches on the selected GPU\n  --gpu-worker              Internal disposable GPU child process\n  --device N                Override the CUDA device ordinal\n  --metrics-listen ADDR     Expose Prometheus text metrics\n  --power-limit-watts N     Apply nvidia-smi power limit\n  --graphics-clock-mhz N    Apply locked graphics clock\n  --memory-clock-mhz N      Apply locked memory clock\n  -h, --help                Show this help"
 }
 
 fn parse_cli() -> Result<Cli> {
@@ -335,7 +337,7 @@ async fn run_gpu_worker(cli: Cli, config: FileConfig, stateaa: StateaaConfig) ->
     let protocol = KryptexProtocol::new(
         stateaa.wallet,
         stateaa.worker,
-        String::new(),
+        stateaa.password,
         KryptexMode::V2,
     );
     let pool_set = KryptexPoolSet::new(vec![endpoint])?;
@@ -383,7 +385,12 @@ async fn run_gpu_worker(cli: Cli, config: FileConfig, stateaa: StateaaConfig) ->
         tokio::select! {
             candidate = candidate_rx.recv() => {
                 let Some((candidate_generation, share)) = candidate else {
-                    return Ok(());
+                    // The proof worker owns this sender. Its failure must not be mistaken
+                    // for a successful shutdown before gpu_task's error is observed.
+                    bridge.abort();
+                    cancel.store(true, Ordering::Release);
+                    actor.abort();
+                    return gpu_task.await.context("joining CUDA worker after share channel closed")?;
                 };
                 if candidate_generation != generation.load(Ordering::Acquire)
                     || cancel.load(Ordering::Acquire)
@@ -391,6 +398,7 @@ async fn run_gpu_worker(cli: Cli, config: FileConfig, stateaa: StateaaConfig) ->
                     warn!(job_id = %share.job_id, "期限切れのGPU候補を送信前に破棄しました");
                     continue;
                 }
+                info!(job_id = %share.job_id, "CPU検証済みシェアをプールへ送信しています");
                 match pool.submit_verified(share.clone()).await {
                     Ok(SubmitResult::Accepted) => info!(job_id = %share.job_id, "Kryptexがシェアを受理しました"),
                     Ok(SubmitResult::Rejected { kind, reason }) => {
@@ -447,8 +455,11 @@ fn gpu_loop(
             let result = (|| -> Result<()> {
                 while let Ok(task) = proof_rx.recv() {
                     if proof_generation.load(Ordering::Acquire) != task.generation {
+                        warn!(job_id = %task.job.job_id, "古いジョブのGPU候補を証明前に破棄しました");
                         continue;
                     }
+                    let proof_started = Instant::now();
+                    info!(job_id = %task.job.job_id, "GPU候補のCPU証明と検証を開始しました");
                     let share = pearl_net::VerifiedShare::from_verified_tile_with_hashrate(
                         &task.problem,
                         &task.job,
@@ -456,12 +467,16 @@ fn gpu_loop(
                         task.hashrate,
                     )
                     .context("CPU reference rejected production GPU candidate")?;
+                    info!("CPU証明と検証が完了しました | ジョブ={} | 証明秒={:.3}",
+                        task.job.job_id, proof_started.elapsed().as_secs_f64());
                     if !proof_cancel.load(Ordering::Acquire)
                         && proof_generation.load(Ordering::Acquire) == task.generation
                     {
                         candidate_tx
                             .blocking_send((task.generation, share))
                             .context("sending CPU-verified share to network task")?;
+                    } else {
+                        warn!(job_id = %task.job.job_id, "証明中にジョブが更新されたためシェアを破棄しました");
                     }
                 }
                 Ok(())
@@ -583,6 +598,17 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stateaa_accepts_optional_password_without_changing_legacy_fields() {
+        let legacy = StateaaConfig::decode(&hex::encode("localhost:9000|wallet|worker|1")).unwrap();
+        assert_eq!(legacy.password, "x");
+        let configured = StateaaConfig::decode(&hex::encode("localhost:9000|wallet|worker|0|d=2097152")).unwrap();
+        assert_eq!(configured.password, "d=2097152");
+        assert!(!configured.log_enabled);
+        for value in ["localhost:9000|wallet|worker|1|", "localhost:9000|wallet|worker|1|x|y", "localhost:9000|wallet|worker|1|x\n"] {
+            assert!(StateaaConfig::decode(&hex::encode(value)).is_err());
+        }
+    }
     #[test]
     fn stateaa_log_is_a_boolean_not_a_filename() {
         for flag in ["1", "true", "ON"] {

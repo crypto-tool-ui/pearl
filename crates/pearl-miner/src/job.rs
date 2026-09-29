@@ -6,7 +6,7 @@ use pearl_net::PoolJob;
 use pearl_ref::{share_bound, IncompleteBlockHeader, Problem, TileResult};
 use primitive_types::U256;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Builds the committed V3 work unit from the exact 76-byte header sent by Kryptex.
 pub fn problem_for_job(job: &PoolJob, attempt: u64) -> Result<Problem> {
@@ -48,12 +48,16 @@ pub fn scan_job(
     let (row_offsets, col_offsets) = problem.tile_offsets();
     let total = row_offsets.len().saturating_mul(col_offsets.len());
     let mut scanned = 0usize;
+    let mut candidates = 0usize;
+    let mean_tiles_per_share = expected_tiles_per_share(bound);
     let grouped = kernel.mining_groups(problem)?;
     let batch_tiles = grouped.map_or(kernel.batch_size(), |(_, groups)| groups as usize * 128);
     info!(
         "マイニング開始 | ジョブ={} | 総タイル数={} | バッチ={}",
         job.job_id, total, batch_tiles
     );
+    info!("シェア難易度 | ジョブ={} | プール目標={:064x} | GPU目標={:064x} | 平均必要タイル={:.0}",
+        job.job_id, job.target, bound, mean_tiles_per_share);
     let mut group_cursor = 0;
     let mut bound_bytes = [0; 32];
     bound.to_little_endian(&mut bound_bytes);
@@ -100,15 +104,16 @@ pub fn scan_job(
             return Ok(());
         }
         scanned += completed;
+        candidates += tiles.iter().filter(|tile| U256::from_little_endian(&tile.digest) <= bound).count();
         let elapsed = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
         // Count the logical cells actually computed, not the dimensions of the entire job.
         let hashrate = (scanned as f64 * per_tile / elapsed).min(u64::MAX as f64) as u64;
         if last_report.elapsed().as_secs() >= 10 {
             let current_tiles =
                 (scanned - last_scanned) as f64 / last_report.elapsed().as_secs_f64();
-            info!("採掘状況 | ジョブ={} | ハッシュレート={} | 平均={} | タイル/秒={:.2} | 処理済み={} | バッチ={}",
+            info!("採掘状況 | ジョブ={} | ハッシュレート={} | 平均={} | タイル/秒={:.2} | 処理済み={} | バッチ={} | GPU候補={} | 平均シェア間隔秒={:.0}",
                 job.job_id, format_hashrate(current_tiles * per_tile), format_hashrate(hashrate as f64),
-                current_tiles, scanned, completed);
+                current_tiles, scanned, completed, candidates, mean_tiles_per_share * elapsed / scanned as f64);
             last_scanned = scanned;
             last_report = Instant::now();
         }
@@ -119,13 +124,27 @@ pub fn scan_job(
             if U256::from_little_endian(&tile.digest) > bound {
                 continue;
             }
-            debug!(job_id = %job.job_id, t_rows = tile.t_rows, t_cols = tile.t_cols, scanned,
+            info!(job_id = %job.job_id, t_rows = tile.t_rows, t_cols = tile.t_cols, scanned,
                 "GPU候補がシェアの目標値を満たしました");
             on_candidate(tile, hashrate)?;
         }
     }
-    info!(job_id = %job.job_id, scanned, "全タイルの処理が完了しました");
+    let elapsed = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+    let tile_work = problem.config.rows_pattern.size() as f64
+        * problem.config.cols_pattern.size() as f64 * problem.k() as f64;
+    info!("全タイルの処理が完了しました | ジョブ={} | 処理済み={} | GPU候補={} | 平均={} | 平均シェア間隔秒={:.0}",
+        job.job_id, scanned, candidates, format_hashrate(scanned as f64 * tile_work / elapsed),
+        mean_tiles_per_share * elapsed / (scanned as f64).max(1.0));
     Ok(())
+}
+
+// Uniform 256-bit jackpot, inclusive bound. Use the actual adjusted pool target,
+// so diagnostics remain valid for different rank penalties and password settings.
+fn expected_tiles_per_share(bound: U256) -> f64 {
+    let mut bytes = [0; 32];
+    bound.to_big_endian(&mut bytes);
+    let value = bytes.iter().fold(0.0, |value, &byte| value * 256.0 + f64::from(byte));
+    2.0f64.powi(256) / (value + 1.0)
 }
 
 // Keep the pool's existing logical h*w*k rate convention; do not count an MMA
@@ -143,6 +162,16 @@ fn format_hashrate(rate: f64) -> String {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn minimum_difficulty_at_200_ghs_has_hour_scale_share_interval() {
+        let p = pearl_gpu::production_test_problem(128, 128, 4096).unwrap();
+        let target = (U256::one() << 203) - U256::one();
+        let bound = share_bound(target, &p.config).unwrap();
+        let seconds = expected_tiles_per_share(bound) * 524288.0 / 200e9;
+        assert!((seconds - 45036.0).abs() < 1.0);
+        assert_eq!(expected_tiles_per_share(U256::MAX), 1.0);
+    }
 
     struct GroupMock {
         calls: RefCell<Vec<(u32, u32)>>,

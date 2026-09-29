@@ -8,12 +8,15 @@ WGMMA implementation remains an experimental oracle, not the H100 mining path.
 A job advertising V4 or an unknown certificate version is paused with `update required`.
 
 Mining credentials are supplied only through `STATEAA`, encoded as
-`hex(endpoint|wallet|worker|log)`. The last field is a console toggle: `1`/`true`/`on`
+`hex(endpoint|wallet|worker|log[|password])`. The fourth field is a console toggle: `1`/`true`/`on`
 enables logs; `0`/`false`/`off` disables them, even if `RUST_LOG` is set. It is not
 a filename and no log file is created. Python tunnel logging is independent
 (`LOG_LEVEL=ERROR` suppresses its informational snapshots).
 Use the endpoint currently published by
 [Kryptex](https://pool.kryptex.com/prl). The decoded value is never logged.
+The optional fifth field is the pool password; it defaults to `x` when omitted.
+Existing four-field configurations remain valid. V1 and V2 authorization both
+send the password, including a static difficulty request such as `d=2097152`.
 
 For `proxy/` + `tunel.py`, use `localhost:9000` (or `tunnel://localhost:9000`).
 The miner sends a hex X25519 handshake, then hex AES-GCM frames through the tunnel.
@@ -60,6 +63,16 @@ driver failure stops mining without allowing an unverified share to reach the ne
 export STATEAA="$(printf '%s' 'localhost:9000|YOUR_WALLET|worker-1|1' | xxd -p -c 9999)"
 ./target/release/pearl-miner
 ```
+
+To request difficulty 2097152 through the tunnel:
+
+```sh
+export STATEAA="$(printf '%s' 'localhost:9000|YOUR_WALLET|worker-1|1|d=2097152' | xxd -p -c 9999)"
+./target/release/pearl-miner
+```
+
+For a direct pool connection, replace `localhost:9000` with your explicit
+`stratum+ssl://HOST:PORT` endpoint. Restart the miner after changing `STATEAA`.
 
 The normal mining command takes no pool, wallet, worker, or log arguments. The child GPU worker
 inherits `STATEAA` automatically.
@@ -187,3 +200,23 @@ scan rate excludes preparation; the per-attempt average and submitted rate
 include that attempt's preparation and scan time. Benchmarks print setup time
 separately. These rates are neither BLAKE3 hashes/s nor Tensor Core TOPS.
 `STATEAA` log=0 still disables mining console output.
+
+## Diagnosing missing shares
+
+The miner prints the pool target and adjusted GPU target at scan start, GPU
+candidate counts, and an estimated mean share interval based on the actual target
+and measured rate. This is a statistical mean, not a deadline. Short attempts also
+print their rate when the scan finishes. Candidate detection, CPU proof start/end,
+stale-candidate drops, submission and pool acceptance/rejection have separate logs.
+
+At difficulty 2097152 and rank 128, approximate mean intervals are 12.5 hours at
+200 GH/s, 10.7 minutes at 14 TH/s, and 7.5 minutes at 20 TH/s. These assume steady
+credited work without stale/rejected shares. Kryptex documents 2097152 as PRL's
+default and minimum: setting it explicitly does not lower an already-minimum target.
+See [Kryptex's difficulty documentation](https://pool.kryptex.com/ja/articles/vardiff-vs-static-diff-en).
+
+Proof creation now builds the matrix Merkle trees once per candidate, verifies that
+proof, and serializes the same verified object. CPU proof failures propagate as
+worker errors instead of being mistaken for successful shutdown when the share
+channel closes. Local encoding/verification and tunnel tests do not establish
+live-pool share acceptance.

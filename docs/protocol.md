@@ -189,7 +189,9 @@ the pool after a job update.
 
 The untracked `B200-Engine8-1440PH` package was inspected as a read-only implementation reference.
 Its pool adapter confirms the V3 Kryptex V2 submit shape: object authorization with `wallet`,
-`agent`, and `type: "v2"`; then `mining.submit.params` contains integer `hs`, `job_id`, and
+`agent`, and `type: "v2"`; the optional pool password is sent as `password`, matching
+`spark-pearl-miner/crates/spm-proto/src/lib.rs` (`KryptexV2Login`). The miner's optional
+fifth STATEAA field supplies it (default `x`). Then `mining.submit.params` contains integer `hs`, `job_id`, and
 `plain_proof`. The adapter removes the final bincode `moe=None` byte before gzip level 1/base64
 encoding. `pearl-net::KryptexProtocol` implements this wire transformation for V2, while V1 remains
 available as the captured subscribe/authorize/plain-proof mode. This is a transport compatibility

@@ -160,7 +160,7 @@ mod tests {
             let protocol = crate::KryptexProtocol::new(
                 "test-wallet".into(),
                 "test-worker".into(),
-                String::new(),
+                "d=2097152".into(),
                 crate::KryptexMode::V2,
             );
             let mut session = crate::KryptexSession::connect(&endpoint, protocol)

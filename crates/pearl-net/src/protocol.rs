@@ -157,6 +157,7 @@ impl KryptexProtocol {
                 json!({
                     "wallet": format!("{}.{}", self.wallet, self.worker),
                     "agent": self.agent,
+                    "password": self.password,
                     "type": "v2"
                 }),
             )],
@@ -309,8 +310,7 @@ impl VerifiedShare {
     ) -> Result<Self> {
         ensure!(problem.header.to_bytes() == job.header, "share header does not match pool job");
         ensure!(!job.requires_update(), "pool advertised an unsupported certificate version");
-        problem.verify_tile_against_target(tile, job.target)?;
-        let proof = problem.proof_for_tile(tile)?;
+        let proof = problem.verified_proof_against_target(tile, job.target)?;
         let proof_bytes = bincode::serialize(&proof).context("serializing verified PlainProof")?;
         Ok(Self {
             job_id: job.job_id.clone(),
