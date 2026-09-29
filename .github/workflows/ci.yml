@@ -124,6 +124,7 @@ jobs:
         with:
           name: pearl-miner-linux-x64-cuda13
           path: |
+            dist/pearl-miner
             dist/*.tar.gz
             dist/*.sha256
           if-no-files-found: error
@@ -146,5 +147,6 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
+            dist/pearl-miner
             dist/*.tar.gz
             dist/*.sha256

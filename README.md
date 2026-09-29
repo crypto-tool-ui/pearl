@@ -118,7 +118,8 @@ Commit the root `Cargo.lock` together with the workflow and miner sources;
 CI uses `--locked`.
 
 Download `pearl-miner-linux-x64-cuda13` from the run's Artifacts section. It contains
-a `.tar.gz` archive and `.sha256` checksum, retained for 30 days. The archive
+the standalone `pearl-miner` binary, a `.tar.gz` archive and a `.sha256` checksum
+covering both files, retained for 30 days. The archive
 includes the executable, example config, Python tunnel, requirements and service file.
 The Linux x64 binary requires glibc 2.35 or newer and a compatible NVIDIA driver.
 
@@ -130,7 +131,9 @@ git push origin v0.1.0
 ```
 
 Once CPU, proxy/tunnel and CUDA build checks pass, the workflow creates the GitHub
-Release and attaches the archive and checksum. Only the release job has
+Release and attaches the standalone binary, archive and checksum. After downloading
+the standalone binary, run `chmod +x pearl-miner` before executing it.
+Only the release job has
 `contents: write`; PR builds cannot publish. Runner checks do not exercise GPU
 execution or establish real-pool share acceptance.
 
