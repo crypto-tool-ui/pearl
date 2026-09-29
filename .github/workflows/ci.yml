@@ -83,7 +83,12 @@ jobs:
         with:
           cuda: "13.0.0"
           method: network
-          sub-packages: '["nvcc", "cudart-dev", "cccl", "cuobjdump"]'
+          sub-packages: '["nvcc", "cudart-dev", "cccl", "cuobjdump", "nvdisasm"]'
+      - name: Verify CUDA compiler and disassembly tools
+        run: |
+          nvcc --version
+          cuobjdump --version
+          nvdisasm --version
       - name: Build miner with embedded sm_75, sm_90a and sm_120a cubins
         run: |
           nvcc --version
