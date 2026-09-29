@@ -1,8 +1,7 @@
-//! CUDA host bindings for Pearl's staged kernels.
+//! CUDA host bindings for Pearl's resident mining kernels and correctness oracles.
 //!
-//! All Rust `unsafe` in this crate is confined to the CUDA driver launch boundary. The host keeps
-//! the reference noise construction on the CPU; the M2 serial CUDA oracle and M3 tensor-core
-//! implementation share the same trait and cannot be selected interchangeably for production.
+//! Production scans generate noise on CUDA, reuse resident matrices, and return only
+//! target hits. Small-tile oracle APIs retain CPU preparation for independent tests.
 
 use std::{
     ffi::{c_void, CString},
@@ -26,6 +25,8 @@ macro_rules! embedded_cubin {
 pub mod m5;
 mod sm75;
 pub use sm75::MmaSm75CudaKernel;
+pub use sm75::ProductionCudaKernel;
+pub use sm75::production_test_problem;
 
 const SM120_MMA_M: usize = 16;
 const SM120_MMA_N: usize = 8;
@@ -49,6 +50,7 @@ pub enum KernelArchitecture {
     Sm120Mma,
     Sm75Mma,
     Sm90Wgmma,
+    Sm90Mma,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +74,13 @@ pub trait GemmKernel {
     fn compute_tiles(&self, problem: &Problem, tiles: &[TileResult]) -> Result<Vec<TileResult>> {
         tiles.iter().map(|tile| self.compute_tile(problem, tile)).collect()
     }
+    /// Number of 128x128 groups and preferred groups per launch, if supported.
+    fn mining_groups(&self, _problem: &Problem) -> Result<Option<(u32, u32)>> { Ok(None) }
+    /// Returns only target-matching tiles. A successful call covers every tile in the range.
+    fn scan_groups(&self, _problem: &Problem, _begin: u32, _count: u32, _bound: [u8; 32]) -> Result<Vec<TileResult>> {
+        bail!("grouped mining is unsupported by this kernel")
+    }
+    fn mining_selftest(&self) -> Result<()> { Ok(()) }
 }
 
 /// Selects a production tensor-core implementation from the device capability.
@@ -86,13 +95,9 @@ pub fn select_production_kernel(device_ordinal: usize) -> Result<Box<dyn GemmKer
         .context("querying CUDA compute capability")?;
 
     match capability {
-        (7, 5) => Ok(Box::new(MmaSm75CudaKernel::from_context(context)?)),
-        (12, 0) => Ok(Box::new(MmaSm120CudaKernel::from_context(context)?)),
-        (9, 0) => bail!(
-            "sm_90 production kernel is unavailable until the M4 WGMMA hardware acceptance passes"
-        ),
+        (7, 5) | (9, 0) | (12, 0) => Ok(Box::new(ProductionCudaKernel::from_context(context)?)),
         (major, minor) => bail!(
-            "no accepted production tensor-core kernel for compute capability {major}.{minor}"
+            "no production tensor-core kernel for compute capability {major}.{minor}"
         ),
     }
 }

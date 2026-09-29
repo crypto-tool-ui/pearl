@@ -79,6 +79,12 @@ impl Problem {
     /// the current correctness-first host API can feed the CUDA kernels and build proofs. A later
     /// streaming worker can replace the storage without changing the job or verifier contract.
     pub fn from_kryptex_header(header: IncompleteBlockHeader) -> Result<Self> {
+        Self::from_kryptex_header_attempt(header, 0)
+    }
+
+    /// Independent committed matrices for subsequent scans of the same pool header.
+    /// The attempt is local seed material, never a modification of the pool header.
+    pub fn from_kryptex_header_attempt(header: IncompleteBlockHeader, attempt: u64) -> Result<Self> {
         let config = MiningConfiguration {
             common_dim: KRYPTEX_K,
             rank: KRYPTEX_RANK,
@@ -87,15 +93,11 @@ impl Problem {
             cols_pattern: PeriodicPattern::from_list(&KRYPTEX_COLS)?,
             moe: None,
         };
-        let mut material = Vec::with_capacity(32 + KRYPTEX_FILL_DOMAIN.len());
         let mut key_material = Vec::with_capacity(128);
         key_material.extend_from_slice(&header.to_bytes());
         key_material.extend_from_slice(&config.to_bytes());
         let job_key = blake3::hash(&key_material);
-        material.extend_from_slice(job_key.as_bytes());
-        material.extend_from_slice(KRYPTEX_FILL_DOMAIN);
-        let fill_digest = blake3::hash(&material);
-        let seed = u64::from_le_bytes(fill_digest.as_bytes()[..8].try_into().unwrap());
+        let seed = matrix_attempt_seed(job_key.as_bytes(), attempt);
         let a = fill_int7(seed, KRYPTEX_DOMAIN_A, KRYPTEX_M as usize * KRYPTEX_K as usize);
         let bt = fill_int7(seed, KRYPTEX_DOMAIN_BT, KRYPTEX_N as usize * KRYPTEX_K as usize);
         Self::new(header, config, KRYPTEX_M, KRYPTEX_N, a, bt)
@@ -456,6 +458,18 @@ fn keyed_matrix_root(matrix: &[i8], key: Hash256) -> Hash256 {
 const KRYPTEX_DOMAIN_A: u64 = 0x7370_6d2d_612d_3031;
 const KRYPTEX_DOMAIN_BT: u64 = 0x7370_6d2d_622d_3031;
 
+fn matrix_attempt_seed(job_key: &[u8; 32], attempt: u64) -> u64 {
+    let mut material = Vec::with_capacity(64);
+    material.extend_from_slice(job_key);
+    material.extend_from_slice(KRYPTEX_FILL_DOMAIN);
+    if attempt != 0 {
+        material.extend_from_slice(b"/attempt/");
+        material.extend_from_slice(&attempt.to_le_bytes());
+    }
+    let digest = blake3::hash(&material);
+    u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap())
+}
+
 fn fill_int7(seed: u64, domain: u64, len: usize) -> Vec<i8> {
     let mut state = seed ^ domain;
     let mut output = Vec::with_capacity(len);
@@ -545,6 +559,19 @@ pub fn test_header_variant(problem: &Problem, timestamp: u32) -> Result<Problem>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matrix_attempts_preserve_initial_vector_and_change_subsequent_work() {
+        let key = [42; 32];
+        let old = blake3::hash(&[&key[..], KRYPTEX_FILL_DOMAIN].concat());
+        assert_eq!(matrix_attempt_seed(&key, 0), u64::from_le_bytes(old.as_bytes()[..8].try_into().unwrap()));
+        let seeds: std::collections::BTreeSet<_> = (0..32).map(|i| matrix_attempt_seed(&key, i)).collect();
+        assert_eq!(seeds.len(), 32);
+        let a = fill_int7(matrix_attempt_seed(&key, 1), KRYPTEX_DOMAIN_A, 1024);
+        let b = fill_int7(matrix_attempt_seed(&key, 2), KRYPTEX_DOMAIN_A, 1024);
+        assert_ne!(a, b);
+        assert!(a.iter().chain(&b).all(|x| (-64..=63).contains(x)));
+    }
 
     #[test]
     fn batch_operands_match_official_noise_for_each_tile() {

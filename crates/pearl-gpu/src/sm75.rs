@@ -19,6 +19,7 @@ pub struct MmaSm75CudaKernel {
     max_block_dim_x: usize,
     max_dynamic_shared_memory: usize,
     resident: RefCell<Option<ResidentJob>>,
+    cubin: &'static [u8],
 }
 
 impl MmaSm75CudaKernel {
@@ -43,6 +44,12 @@ impl MmaSm75CudaKernel {
                 capability.1
             );
         }
+        let cubin = embedded_cubin!("PEARL_SM75_MMA_CUBIN")
+            .ok_or_else(|| anyhow::anyhow!("sm_75 MMA cubin was not built; install CUDA nvcc"))?;
+        Self::with_cubin(context, cubin)
+    }
+
+    fn with_cubin(context: Arc<CudaContext>, cubin: &'static [u8]) -> Result<Self> {
         let warp_size = context
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_WARP_SIZE)
             .context("querying CUDA warp size")?;
@@ -67,8 +74,6 @@ impl MmaSm75CudaKernel {
             .context("querying sm_75 opt-in shared-memory limit")?;
         let max_dynamic_shared_memory = usize::try_from(max_dynamic_shared_memory)
             .context("sm_75 shared-memory limit was negative")?;
-        let cubin = embedded_cubin!("PEARL_SM75_MMA_CUBIN")
-            .ok_or_else(|| anyhow::anyhow!("sm_75 MMA cubin was not built; install CUDA nvcc"))?;
         let kernel = load_cuda_kernel(&context, cubin, "pearl_sm75_mma_tile")?;
         Ok(Self {
             context,
@@ -77,6 +82,7 @@ impl MmaSm75CudaKernel {
             max_block_dim_x,
             max_dynamic_shared_memory,
             resident: RefCell::new(None),
+            cubin,
         })
     }
 
@@ -434,6 +440,306 @@ fn param<T>(value: &T) -> *mut c_void {
     (value as *const T).cast_mut().cast()
 }
 
+/// Shared resident mining adapter, with a separately compiled ISA for each supported device.
+/// The small-tile implementation is retained only for oracle/self-test compatibility.
+pub struct ProductionCudaKernel {
+    base: MmaSm75CudaKernel,
+    scan: LoadedCudaKernel,
+    architecture: KernelArchitecture,
+    groups_per_launch: u32,
+    band: u32,
+    scratch: RefCell<ScanScratch>,
+}
+
+struct ScanScratch {
+    bound: CudaSlice<u32>,
+    count: CudaSlice<u32>,
+    hits: CudaSlice<u32>,
+}
+
+const HIT_CAPACITY: u32 = 256;
+const HIT_WORDS: usize = 26;
+
+impl ProductionCudaKernel {
+    pub fn new(device: usize) -> Result<Self> {
+        Self::from_context(CudaContext::new(device)?)
+    }
+
+    pub(crate) fn from_context(context: Arc<CudaContext>) -> Result<Self> {
+        let (cubin, architecture, band) = match context.compute_capability()? {
+            (7, 5) => (
+                embedded_cubin!("PEARL_PRODUCTION_SM75"),
+                KernelArchitecture::Sm75Mma,
+                4,
+            ),
+            (9, 0) => (
+                embedded_cubin!("PEARL_PRODUCTION_SM90"),
+                KernelArchitecture::Sm90Mma,
+                8,
+            ),
+            (12, 0) => (
+                embedded_cubin!("PEARL_PRODUCTION_SM120"),
+                KernelArchitecture::Sm120Mma,
+                8,
+            ),
+            cc => bail!("unsupported production capability {cc:?}"),
+        };
+        let cubin = cubin.context("production cubin unavailable; rebuild with CUDA nvcc")?;
+        let groups_per_launch = u32::try_from(
+            context.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+        )?
+        .saturating_mul(4)
+        .clamp(32, 1024);
+        let scan = load_cuda_kernel(&context, cubin, "pearl_production_scan")?;
+        let stream = context.default_stream();
+        let scratch = RefCell::new(ScanScratch {
+            bound: stream.alloc_zeros::<u32>(8)?,
+            count: stream.alloc_zeros::<u32>(1)?,
+            hits: stream.alloc_zeros::<u32>(HIT_CAPACITY as usize * HIT_WORDS)?,
+        });
+        Ok(Self {
+            base: MmaSm75CudaKernel::with_cubin(context, cubin)?,
+            scan,
+            architecture,
+            groups_per_launch,
+            band,
+            scratch,
+        })
+    }
+
+    fn scan_once(
+        &self,
+        problem: &Problem,
+        begin: u32,
+        groups: u32,
+        bound: [u8; 32],
+    ) -> Result<Option<Vec<TileResult>>> {
+        let resident = self.base.resident.borrow();
+        let job = resident
+            .as_ref()
+            .context("prepare_job must precede production scan")?;
+        ensure!(
+            job.key == problem.commitment().a_noise_seed
+                && job.shape == (problem.m, problem.n, problem.k(), problem.config.rank),
+            "resident job does not match scan problem"
+        );
+        let stream = self.base.context.default_stream();
+        let mut scratch = self.scratch.borrow_mut();
+        let words: Vec<u32> = bound
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        stream.memcpy_htod(&words, &mut scratch.bound)?;
+        stream.memset_zeros(&mut scratch.count)?;
+        {
+            let (a, _a) = job.a.device_ptr(&stream);
+            let (bt, _bt) = job.bt.device_ptr(&stream);
+            let (seed, _seed) = job.seed.device_ptr(&stream);
+            let ScanScratch { bound, count, hits } = &mut *scratch;
+            let (target, _target) = bound.device_ptr(&stream);
+            let (count, _count) = count.device_ptr_mut(&stream);
+            let (hits, _hits) = hits.device_ptr_mut(&stream);
+            let k = u32::try_from(problem.k())?;
+            let rank = u32::from(problem.config.rank);
+            let mut args = [
+                param(&a),
+                param(&bt),
+                param(&problem.m),
+                param(&problem.n),
+                param(&k),
+                param(&rank),
+                param(&begin),
+                param(&self.band),
+                param(&seed),
+                param(&target),
+                param(&HIT_CAPACITY),
+                param(&count),
+                param(&hits),
+            ];
+            unsafe {
+                result::launch_kernel(
+                    self.scan.function,
+                    (groups, 1, 1),
+                    (128, 1, 1),
+                    0,
+                    stream.cu_stream(),
+                    &mut args,
+                )
+            }?;
+        }
+        let count = stream.clone_dtoh(&scratch.count)?[0];
+        if count > HIT_CAPACITY {
+            return Ok(None);
+        }
+        if count == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let records = stream.clone_dtoh(&scratch.hits.slice(..count as usize * HIT_WORDS))?;
+        let mut tiles = Vec::with_capacity(count as usize);
+        for record in records.chunks_exact(HIT_WORDS) {
+            let mut tile = problem.empty_tile(record[0], record[1])?;
+            tile.transcript.copy_from_slice(&record[2..18]);
+            for (word, bytes) in record[18..26].iter().zip(tile.digest.chunks_exact_mut(4)) {
+                bytes.copy_from_slice(&word.to_le_bytes());
+            }
+            ensure!(
+                tile.digest == compute_jackpot_hash(&tile.transcript, job.key),
+                "production candidate digest mismatch"
+            );
+            ensure!(
+                le_digest_leq(&tile.digest, &bound),
+                "GPU returned a candidate above target"
+            );
+            tiles.push(tile);
+        }
+        // Atomic append order is nondeterministic; stable order simplifies verification and replay.
+        tiles.sort_by_key(|t| (t.t_rows, t.t_cols));
+        ensure!(
+            tiles
+                .windows(2)
+                .all(|w| (w[0].t_rows, w[0].t_cols) != (w[1].t_rows, w[1].t_cols)),
+            "GPU returned duplicate candidates"
+        );
+        Ok(Some(tiles))
+    }
+}
+
+fn le_digest_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().rev().cmp(b.iter().rev()) != std::cmp::Ordering::Greater
+}
+
+impl GemmKernel for ProductionCudaKernel {
+    fn metadata(&self) -> KernelMetadata {
+        KernelMetadata {
+            architecture: self.architecture,
+            precision: KernelPrecision::Int7Int7Int32,
+            certificate_version: 3,
+        }
+    }
+    fn prepare_job(&self, p: &Problem) -> Result<()> {
+        self.base.prepare_job(p)
+    }
+    fn batch_size(&self) -> usize {
+        self.base.batch_size()
+    }
+    fn compute_tile(&self, p: &Problem, t: &TileResult) -> Result<TileResult> {
+        self.base.compute_tile(p, t)
+    }
+    fn compute_tiles(&self, p: &Problem, t: &[TileResult]) -> Result<Vec<TileResult>> {
+        self.base.compute_tiles(p, t)
+    }
+
+    fn mining_groups(&self, p: &Problem) -> Result<Option<(u32, u32)>> {
+        use pearl_ref::{KRYPTEX_COLS, KRYPTEX_ROWS};
+        ensure!(
+            p.m % 128 == 0
+                && p.n % 128 == 0
+                && p.k() % 64 == 0
+                && p.config.rank > 0
+                && p.config.rank % 64 == 0
+                && p.k() % usize::from(p.config.rank) == 0,
+            "production scan requires full 128x128 groups and K/rank multiples of 64"
+        );
+        ensure!(
+            p.config.rows_pattern.indices_with_offset(0) == KRYPTEX_ROWS
+                && p.config.cols_pattern.indices_with_offset(0) == KRYPTEX_COLS,
+            "production scan requires the V3 8x16 periodic proof pattern"
+        );
+        let groups = (p.m / 128)
+            .checked_mul(p.n / 128)
+            .context("group count overflow")?;
+        Ok(Some((groups, self.groups_per_launch)))
+    }
+
+    fn scan_groups(
+        &self,
+        p: &Problem,
+        begin: u32,
+        count: u32,
+        bound: [u8; 32],
+    ) -> Result<Vec<TileResult>> {
+        let (total, limit) = self.mining_groups(p)?.context("group scan unavailable")?;
+        ensure!(
+            count > 0 && count <= limit && begin.checked_add(count).is_some_and(|end| end <= total),
+            "invalid production group range"
+        );
+        if let Some(tiles) = self.scan_once(p, begin, count, bound)? {
+            return Ok(tiles);
+        }
+        // Never silently lose hits at easy targets. Replay disjoint halves until they fit.
+        ensure!(count > 1, "single group overflowed candidate queue");
+        let left = count / 2;
+        let mut tiles = self.scan_groups(p, begin, left, bound)?;
+        tiles.extend(self.scan_groups(p, begin + left, count - left, bound)?);
+        Ok(tiles)
+    }
+
+    fn mining_selftest(&self) -> Result<()> {
+        // Exercise every lane, both staging buffers, cumulative slot wrap, band tails,
+        // inclusive target equality, zero-hit filtering, queue replay, and job replacement.
+        for (m, n, k) in [(128, 128, 256), (256, 384, 2176), (128, 128, 4096)] {
+            let p = production_test_problem(m, n, k)?;
+            self.prepare_job(&p)?;
+            let groups = (m / 128) * (n / 128);
+            let mut tiles = self.scan_groups(&p, 0, groups, [255; 32])?;
+            ensure!(
+                tiles.len() == groups as usize * 128,
+                "production self-test lost tiles"
+            );
+            tiles.sort_by_key(|t| (t.t_rows, t.t_cols));
+            ensure!(
+                tiles
+                    .windows(2)
+                    .all(|w| (w[0].t_rows, w[0].t_cols) != (w[1].t_rows, w[1].t_cols)),
+                "production self-test duplicated a tile across groups"
+            );
+            for tile in &tiles {
+                ensure!(
+                    *tile == p.tile(tile.t_rows, tile.t_cols)?,
+                    "production tile differs from CPU"
+                );
+            }
+            let first_group = self.scan_groups(&p, 0, 1, [255; 32])?;
+            let bound = first_group[37].digest;
+            let expected: Vec<_> = first_group
+                .into_iter()
+                .filter(|t| le_digest_leq(&t.digest, &bound))
+                .collect();
+            ensure!(
+                self.scan_groups(&p, 0, 1, bound)? == expected,
+                "production target compare mismatch"
+            );
+            ensure!(
+                self.scan_groups(&p, 0, 1, [0; 32])?.is_empty(),
+                "production zero target mismatch"
+            );
+        }
+        self.base.resident.borrow_mut().take();
+        Ok(())
+    }
+}
+
+/// Small deterministic fixture with exactly the production proof pattern.
+pub fn production_test_problem(m: u32, n: u32, k: u32) -> Result<Problem> {
+    use pearl_ref::{MiningConfiguration, PeriodicPattern, KRYPTEX_COLS, KRYPTEX_ROWS};
+    let header = pearl_ref::test_problem()?.header;
+    let config = MiningConfiguration {
+        common_dim: k,
+        rank: 128,
+        mma_type: MMAType::Int7xInt7ToInt32,
+        moe: None,
+        rows_pattern: PeriodicPattern::from_list(&KRYPTEX_ROWS)?,
+        cols_pattern: PeriodicPattern::from_list(&KRYPTEX_COLS)?,
+    };
+    let a = (0..m as usize * k as usize)
+        .map(|i| (((i * 13 + 7) % 129) as i32 - 64) as i8)
+        .collect();
+    let bt = (0..n as usize * k as usize)
+        .map(|i| (((i * 17 + 3) % 129) as i32 - 64) as i8)
+        .collect();
+    Problem::new(header, config, m, n, a, bt)
+}
+
 struct ResidentJob {
     key: [u8; 32],
     shape: (u32, u32, usize, u16),
@@ -458,7 +764,7 @@ impl MmaSm75CudaKernel {
             "unsupported T4 noise dimensions"
         );
         let stream = self.context.default_stream();
-        let cubin = embedded_cubin!("PEARL_SM75_MMA_CUBIN").context("T4 cubin unavailable")?;
+        let cubin = self.cubin;
         let uniform_kernel = load_cuda_kernel(&self.context, cubin, "pearl_sm75_uniform")?;
         let noise_kernel = load_cuda_kernel(&self.context, cubin, "pearl_sm75_apply_noise")?;
         let commitment = problem.commitment();

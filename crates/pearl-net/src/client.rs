@@ -396,10 +396,10 @@ impl KryptexSession {
         generation: Arc<AtomicU64>,
     ) -> (
         KryptexHandle,
-        watch::Receiver<Option<PoolJob>>,
+        watch::Receiver<Option<(u64, PoolJob)>>,
         JoinHandle<Result<()>>,
     ) {
-        let (job_tx, job_rx) = watch::channel(self.current_job.clone());
+        let (job_tx, job_rx) = watch::channel(self.current_job.clone().map(|job| (1, job)));
         if self.current_job.is_some() {
             generation.store(1, Ordering::Release);
         }
@@ -581,13 +581,15 @@ async fn receive_from(reader: &mut BufReader<ReadHalf<Box<dyn PoolStream>>>) -> 
 
 fn publish_job(
     job: PoolJob,
-    job_tx: &watch::Sender<Option<PoolJob>>,
+    job_tx: &watch::Sender<Option<(u64, PoolJob)>>,
     cancel: &AtomicBool,
     generation: &AtomicU64,
 ) {
     cancel.store(true, Ordering::Release);
-    generation.fetch_add(1, Ordering::AcqRel);
-    job_tx.send_replace(Some(job));
+    let epoch = generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    // Publish the epoch with the job; reading the global epoch later can label an old
+    // queued job as new if a notification arrives while the GPU is draining its queue.
+    job_tx.send_replace(Some((epoch, job)));
 }
 
 pub struct KryptexPoolSet {
@@ -734,4 +736,31 @@ fn classify_reject(reason: &str) -> RejectKind {
 
 fn tracing_error(error: &anyhow::Error) {
     tracing::warn!(error = %format!("{error:#}"), "プールへの再接続に失敗しました");
+}
+
+#[cfg(test)]
+mod job_generation_tests {
+    use super::*;
+
+    #[test]
+    fn queued_job_keeps_its_generation_when_a_new_job_arrives() {
+        let job = PoolJob {
+            job_id: "old".into(), header: [0; 76], target: primitive_types::U256::one(),
+            target_be: [0; 32], height: None, difficulty: None, cert_version: Some(3),
+        };
+        let (tx, rx) = watch::channel(None);
+        let cancel = AtomicBool::new(false);
+        let generation = AtomicU64::new(0);
+        publish_job(job.clone(), &tx, &cancel, &generation);
+        let queued = rx.borrow().clone().unwrap();
+        let mut next = job;
+        next.job_id = "new".into();
+        publish_job(next, &tx, &cancel, &generation);
+        assert_eq!(queued.0, 1);
+        assert_eq!(queued.1.job_id, "old");
+        assert_eq!(generation.load(Ordering::Acquire), 2);
+        assert_ne!(queued.0, generation.load(Ordering::Acquire));
+        assert_eq!(rx.borrow().as_ref().unwrap().0, 2);
+        assert!(cancel.load(Ordering::Acquire));
+    }
 }

@@ -1,9 +1,11 @@
 # Pearl V3 GPU miner
 
 This repository targets Pearl certificate V3 with the official INT7 consensus arithmetic represented
-by INT8 tensor-core operands. Runtime dispatch selects sm_75 `mma.sync` on T4 or
-sm_120a `mma.sync` on RTX PRO 6000 Blackwell. The sm_90a WGMMA kernel is built,
-but H100/H200 mining dispatch remains blocked pending hardware acceptance. A job advertising V4 or an unknown certificate version is paused with `update required`.
+by INT8 tensor-core operands. Runtime dispatch selects a resident, grouped `mma.sync`
+mining kernel on T4 (sm_75), H100/H200 (sm_90a), or RTX PRO 6000 Blackwell (sm_120a).
+Every device must pass the production-kernel CPU comparison at startup. The older
+WGMMA implementation remains an experimental oracle, not the H100 mining path.
+A job advertising V4 or an unknown certificate version is paused with `update required`.
 
 Mining credentials are supplied only through `STATEAA`, encoded as
 `hex(endpoint|wallet|worker|log)`. The last field is a console toggle: `1`/`true`/`on`
@@ -41,10 +43,15 @@ CPU reference and protocol tests remain usable without an NVIDIA driver.
 cargo run --release -p pearl-miner -- --benchmark
 cp config.example.toml config.toml
 cargo run --release -p pearl-miner -- --selftest
+cargo run --release -p pearl-miner -- --gpu-benchmark --device 0
 ```
 
-The self-test must pass before the daemon is started. It compares production-kernel tiles (including full and partial T4 batches) with
-the CPU reference and exits on any mismatch. The daemon uses a disposable `--gpu-worker` child so a
+The self-test must pass before the daemon is started. It compares the production scan
+against the CPU reference, including every lane, transcript wrap, target equality,
+queue overflow replay, and job replacement, and exits on any mismatch.
+`--gpu-benchmark` uses production-sized resident matrices and counts MAC/s; it includes
+launch and result-count readback but excludes setup and CPU proofs (setup is printed separately).
+The daemon uses a disposable `--gpu-worker` child so a
 driver failure stops mining without allowing an unverified share to reach the network.
 
 ## Run from environment
@@ -141,46 +148,42 @@ Only the release job has
 `contents: write`; PR builds cannot publish. Runner checks do not exercise GPU
 execution or establish real-pool share acceptance.
 
-## NVIDIA T4 (sm_75)
+## Production GPU mining: T4, H100 and RTX PRO 6000 Blackwell
 
-The release binary embeds a separate Turing INT8 Tensor Core kernel using
-`mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32`. Compute capability 7.5 selects
-it automatically; the usual GPU self-test and CPU share verification still apply.
-It loads operands into registers without cp.async or TMA, pads tiles to 8×8,
-and retains the V3 cumulative transcript and fused keyed BLAKE3 digest.
-The naive oracle and tensor-hash kernels also build for sm_75.
+The miner embeds separate sm_75, sm_90a and sm_120a cubins. The new scan groups
+128 logical proof tiles in a 128×128 block, reuses matrix operands through two
+shared-memory stages, keeps transcripts in registers and checks targets on GPU.
+T4 uses `m8n8k16` plus register prefetch; H100 and Blackwell use `m16n8k32` plus
+`cp.async`. This is a new grouped MMA path; the old WGMMA kernel is not selected.
 
-On a T4 host, build with CUDA 13, then run:
+Matrices and official noise remain in VRAM throughout an attempt. Only target
+hits return to a bounded CPU proof worker. The scan continues after finding a
+share and starts a fresh matrix attempt after exhausting its work. Every share
+still passes the official CPU verification before submission.
+
+Run on each target GPU:
 
 ```sh
-bash tools/check_sm75_sass.sh
-bash tools/run_sm75_acceptance.sh
 ./target/release/pearl-miner --selftest --device 0
+./target/release/pearl-miner --gpu-benchmark --device 0
+PEARL_GPU_DEVICE=0 bash tools/run_production_acceptance.sh
 ```
 
-The acceptance script requires a real 7.5 GPU and fails on missing prerequisites.
-It checks the golden tile, production dispatch, 10,000 randomized tiles against
-both CPU and naive CUDA, and prints a tile benchmark. This path has been compiled
-and its IMMA instruction verified; GPU correctness, hashrate and pool acceptance
-remain unverified until those hardware checks run. This is an initial T4 path,
-not a claim of maximum mining throughput.
+Without a GPU, validate source arithmetic and cubins with:
 
-T4 mining now keeps the job's A/B matrices in VRAM (about 1 GiB for the production
-shape), generates the official noise on CUDA once per job, and reuses device
-buffers. Mining launches up to 1024 tile blocks and transfers only row/column
-indices and results per batch. The earlier CPU-noise path remains a test fallback.
-CPU matrix generation and commitments still precede GPU preparation; this change
-does not guarantee a particular utilization or hashrate without hardware measurements.
+```sh
+python3 tools/verify_production_kernel.py
+bash tools/check_production_sass.sh
+```
 
-Console output is plain Japanese text, including severity and normal field labels.
-Every ten seconds the miner prints current/average work-normalized hashrate in
-H/s, kH/s, MH/s, GH/s or TH/s alongside tiles/s. Rates count logical h×w×k work
-per tile, as sent to the pool; they are not raw BLAKE3 hashes/s or advertised
-Tensor Core TOPS. Underlying CUDA/library errors and pool rejection reasons retain
-their original diagnostic text. `STATEAA` log=0 still disables console logging.
+The grouped path has CPU arithmetic and compilation checks. GPU correctness,
+sustained throughput and pool acceptance require the hardware checks above;
+no target hashrate is guaranteed. CPU matrix generation, commitment hashing
+and proof work remain potential bottlenecks. See [implementation and validation
+notes](docs/production-gpu.md) for references, constraints and test coverage.
 
-`python3 tools/verify_sm75_noise.py` compiles the scalar CUDA preparation code for
-CPU execution and compares six cases with the official Rust reference. It needs
-Rust and a C++ compiler. Real-device tests additionally check resident batches,
-partial batches and job changes. Startup self-test checks the resident path before
-mining; run `bash tools/run_sm75_acceptance.sh` on T4 for the full suite.
+Console hashrates use logical `h × w × k` MAC/s: 1 TH/s = 10¹² MAC/s. Current
+scan rate excludes preparation; the per-attempt average and submitted rate
+include that attempt's preparation and scan time. Benchmarks print setup time
+separately. These rates are neither BLAKE3 hashes/s nor Tensor Core TOPS.
+`STATEAA` log=0 still disables mining console output.

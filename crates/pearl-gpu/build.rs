@@ -4,6 +4,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(pearl_cuda_built)");
     println!("cargo:rerun-if-changed=../../cuda/naive.cu");
     println!("cargo:rerun-if-changed=../../cuda/sm75_mma.cu");
+    println!("cargo:rerun-if-changed=../../cuda/production.cu");
     println!("cargo:rerun-if-changed=../../cuda/sm120_mma.cu");
     println!("cargo:rerun-if-changed=../../cuda/sm90_wgmma.cu");
     println!("cargo:rerun-if-changed=../../cuda/tensor_hash.cu");
@@ -20,6 +21,20 @@ fn main() {
 
     println!("cargo:rustc-cfg=pearl_cuda_built");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
+    for (arch, name) in [
+        ("sm_75", "PEARL_PRODUCTION_SM75"),
+        ("sm_90a", "PEARL_PRODUCTION_SM90"),
+        ("sm_120a", "PEARL_PRODUCTION_SM120"),
+    ] {
+        let output = out_dir.join(format!("pearl_production_{arch}.cubin"));
+        let status = Command::new(&nvcc)
+            .args(["-std=c++17", "-O3", "-lineinfo", "-Xptxas=-v", "-cubin",
+                &format!("-arch={arch}"), "-o", output.to_str().expect("UTF-8 path"),
+                "../../cuda/production.cu"])
+            .status().expect("execute nvcc for production kernel");
+        assert!(status.success(), "production kernel compilation failed for {arch}");
+        println!("cargo:rustc-env={name}={}", output.display());
+    }
     for (arch, env_name) in [
         ("sm_75", "PEARL_NAIVE_CUBIN_SM75"),
         ("sm_90a", "PEARL_NAIVE_CUBIN_SM90"),

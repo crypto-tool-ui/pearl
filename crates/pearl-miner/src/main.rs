@@ -108,6 +108,7 @@ struct CudaConfig {
 struct Cli {
     config: PathBuf,
     benchmark: bool,
+    gpu_benchmark: bool,
     selftest: bool,
     gpu_worker: bool,
     device: Option<usize>,
@@ -122,7 +123,7 @@ fn default_device() -> usize {
 }
 
 fn usage() -> &'static str {
-    "pearl-miner [OPTIONS]\n\n  STATEAA=hex(endpoint|wallet|worker|log)\n  log: 1 = console on, 0 = console off\n\n  --config PATH             Read optional device/metrics config\n  --benchmark               Run the offline CPU benchmark\n  --selftest                Verify golden tiles and batches on the selected GPU\n  --gpu-worker              Internal disposable GPU child process\n  --device N                Override the CUDA device ordinal\n  --metrics-listen ADDR     Expose Prometheus text metrics\n  --power-limit-watts N     Apply nvidia-smi power limit\n  --graphics-clock-mhz N    Apply locked graphics clock\n  --memory-clock-mhz N      Apply locked memory clock\n  -h, --help                Show this help"
+    "pearl-miner [OPTIONS]\n\n  STATEAA=hex(endpoint|wallet|worker|log)\n  log: 1 = console on, 0 = console off\n\n  --config PATH             Read optional device/metrics config\n  --benchmark               Run the offline CPU benchmark\n  --gpu-benchmark           Self-test and benchmark resident production GPU mining\n  --selftest                Verify golden tiles and batches on the selected GPU\n  --gpu-worker              Internal disposable GPU child process\n  --device N                Override the CUDA device ordinal\n  --metrics-listen ADDR     Expose Prometheus text metrics\n  --power-limit-watts N     Apply nvidia-smi power limit\n  --graphics-clock-mhz N    Apply locked graphics clock\n  --memory-clock-mhz N      Apply locked memory clock\n  -h, --help                Show this help"
 }
 
 fn parse_cli() -> Result<Cli> {
@@ -138,6 +139,7 @@ fn parse_cli() -> Result<Cli> {
         match arg.as_str() {
             "--config" => cli.config = PathBuf::from(value("--config", &mut args)?),
             "--benchmark" => cli.benchmark = true,
+            "--gpu-benchmark" => cli.gpu_benchmark = true,
             "--selftest" => cli.selftest = true,
             "--gpu-worker" => cli.gpu_worker = true,
             "--device" => cli.device = Some(value("--device", &mut args)?.parse().context("invalid --device")?),
@@ -196,6 +198,7 @@ fn selftest_kernel(kernel: &dyn GemmKernel, device: usize) -> Result<()> {
         ensure!(kernel.compute_tiles(&problem, partial)? == partial,
             "GPU partial batch self-test mismatch");
     }
+    kernel.mining_selftest().context("production grouped mining self-test failed")?;
     info!(device, "GPU自己診断に合格しました。マイニングを開始できます");
     Ok(())
 }
@@ -218,13 +221,41 @@ fn run_benchmark() -> Result<()> {
     let operations = tile.rows.len() as f64
         * tile.cols.len() as f64
         * problem.config.dot_product_length() as f64
-        * 2.0
         * f64::from(iterations);
     println!(
-        "CPU参照ベンチマーク: {:.2} tiles/s, {:.3} effective TH/s",
+        "CPU参照ベンチマーク: {:.2} tiles/s, {:.3} TH/s (MAC/s)",
         tiles_per_second,
         operations / seconds.max(f64::MIN_POSITIVE) / 1.0e12
     );
+    Ok(())
+}
+
+fn run_gpu_benchmark(device: usize) -> Result<()> {
+    let kernel = select_production_kernel(device)?;
+    selftest_kernel(&*kernel, device)?;
+    info!(device, "本番サイズのGPUベンチマークを準備しています");
+    let preparation = Instant::now();
+    let problem = pearl_ref::Problem::from_kryptex_header(test_problem()?.header)?;
+    kernel.prepare_job(&problem)?;
+    let prep_seconds = preparation.elapsed().as_secs_f64();
+    let (groups, batch) = kernel.mining_groups(&problem)?.context("grouped kernel unavailable")?;
+    kernel.scan_groups(&problem, 0, batch.min(groups), [0; 32])?;
+    let started = Instant::now();
+    let mut cursor = 0;
+    let mut scanned = 0u64;
+    let mut launches = 0u64;
+    while started.elapsed().as_secs_f64() < 10.0 {
+        let count = batch.min(groups - cursor);
+        ensure!(kernel.scan_groups(&problem, cursor, count, [0; 32])?.is_empty(),
+            "zero-target benchmark returned a hit");
+        scanned += u64::from(count) * 128;
+        launches += 1;
+        cursor = (cursor + count) % groups;
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    println!("GPUベンチマーク {:?}: {:.3} TH/s (MAC/s) | {:.2} tiles/s | 準備={:.3}秒 | 計測={:.3}秒 | 起動回数={} | M={} N={} K={} | シェア証明と準備時間を除外",
+        kernel.metadata().architecture, scanned as f64 * 128.0 * problem.k() as f64 / seconds / 1e12,
+        scanned as f64 / seconds, prep_seconds, seconds, launches, problem.m, problem.n, problem.k());
     Ok(())
 }
 
@@ -391,46 +422,127 @@ async fn run_gpu_worker(cli: Cli, config: FileConfig, stateaa: StateaaConfig) ->
 
 fn gpu_loop(
     device: usize,
-    job_rx: std_mpsc::Receiver<PoolJob>,
+    job_rx: std_mpsc::Receiver<(u64, PoolJob)>,
     candidate_tx: mpsc::Sender<(u64, pearl_net::VerifiedShare)>,
     cancel: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
 ) -> Result<()> {
-    let kernel = select_production_kernel(device).context("selecting the production CUDA kernel")?;
+    let kernel =
+        select_production_kernel(device).context("selecting the production CUDA kernel")?;
     selftest_kernel(&*kernel, device)?;
-
-    while let Ok(mut job) = job_rx.recv() {
-        while let Ok(newest) = job_rx.try_recv() {
-            job = newest;
-        }
-        let this_generation = generation.load(Ordering::Acquire);
-        cancel.store(false, Ordering::Release);
-        let preparation = Instant::now();
-        info!(job_id = %job.job_id, "CPUでジョブ行列とコミットメントを準備しています");
-        let problem = job::problem_for_job(&job)?;
-        problem.commitment();
-        if generation.load(Ordering::Acquire) != this_generation { continue; }
-        let cpu_seconds = preparation.elapsed().as_secs_f64();
-        let gpu_preparation = Instant::now();
-        info!("GPUにジョブを準備しています | ジョブ={}", job.job_id);
-        kernel.prepare_job(&problem).context("GPUジョブの準備に失敗しました")?;
-        if generation.load(Ordering::Acquire) != this_generation { continue; }
-        info!("ジョブ準備完了 | ジョブ={} | CPU準備={:.3}秒 | GPU準備={:.3}秒 | バッチ={}",
-            job.job_id, cpu_seconds, gpu_preparation.elapsed().as_secs_f64(), kernel.batch_size());
-        if let Some(share) = job::find_verified_share(&problem, &job, &*kernel, || {
-            cancel.load(Ordering::Acquire)
-                || generation.load(Ordering::Acquire) != this_generation
-        })? {
-            if !cancel.load(Ordering::Acquire)
-                && generation.load(Ordering::Acquire) == this_generation
-            {
-                candidate_tx
-                    .blocking_send((this_generation, share))
-                    .context("sending verified GPU candidate to network task")?;
-            }
-        }
+    struct ProofTask {
+        generation: u64,
+        problem: Arc<pearl_ref::Problem>,
+        job: PoolJob,
+        tile: pearl_ref::TileResult,
+        hashrate: u64,
     }
-    Ok(())
+    let (proof_tx, proof_rx) = std_mpsc::sync_channel::<ProofTask>(2);
+    let proof_failed = AtomicBool::new(false);
+    std::thread::scope(|scope| -> Result<()> {
+        let proof_generation = &generation;
+        let proof_cancel = &cancel;
+        let proof_error = &proof_failed;
+        let proof_worker = scope.spawn(move || {
+            let result = (|| -> Result<()> {
+                while let Ok(task) = proof_rx.recv() {
+                    if proof_generation.load(Ordering::Acquire) != task.generation {
+                        continue;
+                    }
+                    let share = pearl_net::VerifiedShare::from_verified_tile_with_hashrate(
+                        &task.problem,
+                        &task.job,
+                        &task.tile,
+                        task.hashrate,
+                    )
+                    .context("CPU reference rejected production GPU candidate")?;
+                    if !proof_cancel.load(Ordering::Acquire)
+                        && proof_generation.load(Ordering::Acquire) == task.generation
+                    {
+                        candidate_tx
+                            .blocking_send((task.generation, share))
+                            .context("sending CPU-verified share to network task")?;
+                    }
+                }
+                Ok(())
+            })();
+            if result.is_err() {
+                proof_error.store(true, Ordering::Release);
+            }
+            result
+        });
+        let mining_result = (|| -> Result<()> {
+            while let Ok(mut tagged_job) = job_rx.recv() {
+                while let Ok(newest) = job_rx.try_recv() {
+                    tagged_job = newest;
+                }
+                let (this_generation, job) = tagged_job;
+                cancel.store(false, Ordering::Release);
+                let mut attempt = 0u64;
+                loop {
+                    ensure!(
+                        !proof_failed.load(Ordering::Acquire),
+                        "CPU proof worker failed"
+                    );
+                    if cancel.load(Ordering::Acquire)
+                        || generation.load(Ordering::Acquire) != this_generation
+                    {
+                        break;
+                    }
+                    let preparation = Instant::now();
+                    info!(job_id = %job.job_id, "CPUでジョブ行列とコミットメントを準備しています");
+                    let problem = Arc::new(job::problem_for_job(&job, attempt)?);
+                    problem.commitment();
+                    if generation.load(Ordering::Acquire) != this_generation {
+                        break;
+                    }
+                    let cpu_seconds = preparation.elapsed().as_secs_f64();
+                    let gpu_preparation = Instant::now();
+                    info!("GPUにジョブを準備しています | ジョブ={}", job.job_id);
+                    kernel
+                        .prepare_job(&problem)
+                        .context("GPUジョブの準備に失敗しました")?;
+                    if generation.load(Ordering::Acquire) != this_generation {
+                        break;
+                    }
+                    info!("ジョブ準備完了 | ジョブ={} | CPU準備={:.3}秒 | GPU準備={:.3}秒 | バッチ={}",
+                        job.job_id, cpu_seconds, gpu_preparation.elapsed().as_secs_f64(),
+                        kernel.mining_groups(&problem)?.map_or(kernel.batch_size(), |(_, groups)| groups as usize * 128));
+                    job::scan_job(
+                        &problem,
+                        &job,
+                        &*kernel,
+                        || {
+                            cancel.load(Ordering::Acquire)
+                                || generation.load(Ordering::Acquire) != this_generation
+                                || proof_failed.load(Ordering::Acquire)
+                        },
+                        preparation,
+                        |tile, hashrate| {
+                            proof_tx
+                                .send(ProofTask {
+                                    generation: this_generation,
+                                    problem: problem.clone(),
+                                    job: job.clone(),
+                                    tile,
+                                    hashrate,
+                                })
+                                .context("queueing GPU candidate for CPU proof")
+                        },
+                    )?;
+                    attempt = attempt
+                        .checked_add(1)
+                        .context("matrix attempt counter exhausted")?;
+                }
+            }
+            Ok(())
+        })();
+        drop(proof_tx);
+        proof_worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("CPU proof worker panicked"))??;
+        mining_result
+    })
 }
 
 async fn async_main() -> Result<()> {
@@ -441,6 +553,10 @@ async fn async_main() -> Result<()> {
         return run_benchmark();
     }
     let device = selected_device(&cli, &config);
+    if cli.gpu_benchmark {
+        init_tracing(true)?;
+        return run_gpu_benchmark(device);
+    }
     if cli.selftest {
         init_tracing(true)?;
         return run_selftest(device);

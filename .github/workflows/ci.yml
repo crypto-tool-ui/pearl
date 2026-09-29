@@ -30,6 +30,8 @@ jobs:
         run: cargo build --release --locked
       - name: Run CPU-only tests
         run: cargo test --locked
+      - name: Check production kernel arithmetic with CPU fragment emulation
+        run: python3 tools/verify_production_kernel.py
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -97,12 +99,14 @@ jobs:
           export NVCC="$(command -v nvcc)"
           cargo build --release --locked -p pearl-miner
           cargo test --locked -p pearl-gpu --features gpu --test sm75 --no-run
+          cargo test --locked -p pearl-gpu --features gpu --test production --no-run
           target/release/pearl-miner --help
           target/release/pearl-miner --benchmark
       - name: Verify CUDA kernels without a GPU
         run: |
           python3 tools/verify_sm75_noise.py
           bash tools/check_sm75_sass.sh
+          bash tools/check_production_sass.sh
           bash tools/check_sm120_sass.sh
           bash tools/check_sm90_sass.sh
           bash tools/check_tensor_hash.sh

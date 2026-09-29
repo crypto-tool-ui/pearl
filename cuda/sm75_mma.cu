@@ -1,7 +1,7 @@
 // Turing / T4: signed INT8 Tensor Core GEMM, with the Pearl V3 cumulative transcript.
 // PTX m8n8k16 fragments: https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m8n8k16
 // Direct register loads avoid cp.async/TMA, which are unavailable on sm_75.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 750 && !defined(PEARL_PORTABLE_MMA)
 #error "sm75_mma.cu must be compiled for sm_75"
 #endif
 #include <stdint.h>

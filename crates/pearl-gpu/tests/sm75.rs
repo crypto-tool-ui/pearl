@@ -206,11 +206,10 @@ fn sm75_mma_benchmark() {
     let operations = tile.rows.len() as f64
         * tile.cols.len() as f64
         * problem.config.dot_product_length() as f64
-        * 2.0
         * iterations as f64;
     let effective_ths = operations / seconds / 1.0e12;
     println!(
-        "sm_75 benchmark: {:.2} tiles/s, {:.3} effective TH/s ({} tiles, k={}, device={})",
+        "sm_75 fallback benchmark (includes CPU noise/copies): {:.2} tiles/s, {:.3} TH/s (MAC/s; {} tiles, k={}, device={})",
         tiles_per_second,
         effective_ths,
         iterations,
