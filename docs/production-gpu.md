@@ -51,6 +51,13 @@ after shares and derives fresh matrix seeds after exhausting an attempt without
 changing the pool header. Generation tags travel with jobs; stale candidates are
 checked before proof construction and again before submission.
 
+Matrix generation and commitment hashing run on a dedicated CPU worker with one
+attempt of lookahead, overlapping the current GPU scan. The first attempt still
+pays the full preparation cost. Logs distinguish CPU preparation duration from
+CPU wait time; whole-attempt hashrate includes the actual wait and GPU preparation,
+without counting overlapped CPU work twice. Stale prepared attempts are discarded.
+This uses approximately one additional GiB of matrix RAM, plus hashing scratch.
+
 Matrix generation and commitment hashing still run on the CPU, and Merkle proof
 construction remains a CPU cost. These can limit whole-miner throughput on fast
 GPUs even when scan throughput improves. Queued proof tasks retain their matrix

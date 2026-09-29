@@ -35,6 +35,7 @@ use tracing::{error, info, warn};
 
 mod job;
 mod logging;
+mod prefetch;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct FileConfig {
@@ -494,6 +495,21 @@ fn gpu_loop(
                 let (this_generation, job) = tagged_job;
                 cancel.store(false, Ordering::Release);
                 let mut attempt = 0u64;
+                let prep_generation = generation.clone();
+                let prep_cancel = cancel.clone();
+                let prep_job = job.clone();
+                let prefetch = prefetch::Prefetch::new(move |attempt| -> Result<Option<(Arc<pearl_ref::Problem>, f64)>> {
+                    let current = || !prep_cancel.load(Ordering::Acquire)
+                        && prep_generation.load(Ordering::Acquire) == this_generation;
+                    if !current() { return Ok(None); }
+                    let started = Instant::now();
+                    let problem = Arc::new(job::problem_for_job(&prep_job, attempt)?);
+                    if !current() { return Ok(None); }
+                    problem.commitment();
+                    if !current() { return Ok(None); }
+                    Ok(Some((problem, started.elapsed().as_secs_f64())))
+                });
+                prefetch.request(attempt)?;
                 loop {
                     ensure!(
                         !proof_failed.load(Ordering::Acquire),
@@ -505,13 +521,14 @@ fn gpu_loop(
                         break;
                     }
                     let preparation = Instant::now();
-                    info!(job_id = %job.job_id, "CPUでジョブ行列とコミットメントを準備しています");
-                    let problem = Arc::new(job::problem_for_job(&job, attempt)?);
-                    problem.commitment();
+                    let Some((problem, cpu_seconds)) = prefetch.receive()?? else { break; };
+                    let cpu_wait = preparation.elapsed().as_secs_f64();
                     if generation.load(Ordering::Acquire) != this_generation {
                         break;
                     }
-                    let cpu_seconds = preparation.elapsed().as_secs_f64();
+                    let next_attempt = attempt.checked_add(1)
+                        .context("matrix attempt counter exhausted")?;
+                    prefetch.request(next_attempt)?;
                     let gpu_preparation = Instant::now();
                     info!("GPUにジョブを準備しています | ジョブ={}", job.job_id);
                     kernel
@@ -520,8 +537,8 @@ fn gpu_loop(
                     if generation.load(Ordering::Acquire) != this_generation {
                         break;
                     }
-                    info!("ジョブ準備完了 | ジョブ={} | CPU準備={:.3}秒 | GPU準備={:.3}秒 | バッチ={}",
-                        job.job_id, cpu_seconds, gpu_preparation.elapsed().as_secs_f64(),
+                    info!("ジョブ準備完了 | ジョブ={} | CPU準備={:.3}秒 | CPU待機={:.3}秒 | GPU準備={:.3}秒 | バッチ={}",
+                        job.job_id, cpu_seconds, cpu_wait, gpu_preparation.elapsed().as_secs_f64(),
                         kernel.mining_groups(&problem)?.map_or(kernel.batch_size(), |(_, groups)| groups as usize * 128));
                     job::scan_job(
                         &problem,
@@ -545,9 +562,7 @@ fn gpu_loop(
                                 .context("queueing GPU candidate for CPU proof")
                         },
                     )?;
-                    attempt = attempt
-                        .checked_add(1)
-                        .context("matrix attempt counter exhausted")?;
+                    attempt = next_attempt;
                 }
             }
             Ok(())

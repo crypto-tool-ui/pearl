@@ -65,7 +65,8 @@ pub fn scan_job(
     let mut offsets = row_offsets
         .into_iter()
         .flat_map(|row| col_offsets.iter().copied().map(move |col| (row, col)));
-    let mut last_report = Instant::now();
+    let scan_started = Instant::now();
+    let mut last_report = scan_started;
     let mut last_scanned = 0usize;
     loop {
         if should_cancel() {
@@ -132,8 +133,9 @@ pub fn scan_job(
     let elapsed = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
     let tile_work = problem.config.rows_pattern.size() as f64
         * problem.config.cols_pattern.size() as f64 * problem.k() as f64;
-    info!("全タイルの処理が完了しました | ジョブ={} | 処理済み={} | GPU候補={} | 平均={} | 平均シェア間隔秒={:.0}",
+    info!("全タイルの処理が完了しました | ジョブ={} | 処理済み={} | GPU候補={} | 平均={} | スキャン速度={} | 平均シェア間隔秒={:.0}",
         job.job_id, scanned, candidates, format_hashrate(scanned as f64 * tile_work / elapsed),
+        format_hashrate(scanned as f64 * tile_work / scan_started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)),
         mean_tiles_per_share * elapsed / (scanned as f64).max(1.0));
     Ok(())
 }
