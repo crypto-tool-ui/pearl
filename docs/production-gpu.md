@@ -23,11 +23,19 @@ build scripts, runners, binary bundles, or kernel dependencies.
 
 ## Implementation
 
-All three targets use a 128x128x64 CTA, four 64x64 warp tiles, and 128 independent
-8x16 proof tiles per CTA. Each lane owns 128 cumulative int32 accumulators and its
-16-word transcript. Two shared-memory stages use 32 KiB. T4 prefetches 16-byte global
-loads through registers; H100 and Blackwell use cp.async and m16n8k32 rather than
-T4's m8n8k16. The H100 path is MMA, not WGMMA; no peak-performance claim is made.
+All three targets use a 128x128x64 CTA and 128 independent 8x16 proof tiles.
+T4 uses eight 32x64 warp tiles (256 threads), with 64 accumulators per lane.
+Pairs of warps compute the two 4x16 halves of a proof. Since transcript XOR and
+rotation are linear, their partial transcripts are merged once after the K loop.
+The merge reuses matrix staging memory after the final reader barrier; there is
+no extra barrier at each rank boundary. CUDA 13 compiles this to 128 registers per
+thread with zero spills, using a two-block launch bound (previously 227 registers
+with 128-thread CTAs). Hardware occupancy and speed still require measurement.
+
+H100 and Blackwell retain four 64x64 warp tiles and 128 accumulators per lane.
+Two shared-memory stages use 32 KiB. T4 prefetches 16-byte global loads through
+registers; H100 and Blackwell use cp.async and m16n8k32 rather than T4's m8n8k16.
+The H100 path is MMA, not WGMMA; no peak-performance claim is made.
 
 The proof pattern, rank=128, K=4096, keyed BLAKE3, target endianness and official
 CPU proof verifier are preserved. The scan accepts only complete 128x128 groups,
@@ -36,7 +44,8 @@ fail explicitly. The small-tile APIs remain available for oracle tests.
 
 A/B and their noise stay resident for an attempt. The device computes tile indices
 from a banded raster; the CPU no longer allocates and transfers row/column arrays
-for every mining batch. Launch size is four CTAs per SM, bounded to 32..1024 CTAs;
+for every mining batch. Launch size is sixteen CTAs per SM on T4 and four on H100/Blackwell, bounded
+to 32..4096 CTAs. The larger T4 batch amortizes counter readback and launch costs;
 band height is 4 on T4 and 8 on H100/Blackwell. These are initial bounded defaults,
 not device-measured autotuning results.
 
@@ -71,7 +80,7 @@ cross-job execution.
   error propagation, seed rotation, and protocol tests.
 - `python3 tools/verify_production_kernel.py`: executes the actual CUDA source
   control flow using CPU-emulated PTX fragments. Checks all lanes against scalar
-  matrix multiplication at K=128 and K=2176, staging, transcript wrap/rotation,
+  matrix multiplication at K=128, K=2176 and K=4096, staging, transcript wrap/rotation,
   target filtering, raster offsets and queue bounds for both instruction branches.
   This does not simulate CUDA scheduling, async-copy timing, or hardware faults.
 - `bash tools/check_production_sass.sh`: compiles sm_75, sm_90a, sm_120a, verifies

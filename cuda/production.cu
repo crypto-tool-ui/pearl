@@ -1,12 +1,19 @@
 // Dense V3 mining: one 128x128 CTA contains 128 independent 8x16 proof tiles.
-// Each lane owns its complete cumulative transcript. No cross-lane reduction.
+// T4 splits each proof across two warps and merges their linear transcripts once.
+// Newer architectures retain one complete proof per lane.
 // sm75: m8n8k16 and register-prefetched loads; sm90/sm120: m16n8k32 + cp.async.
 // Written against the existing Pearl fragment contract; no third-party kernel code.
 #define PEARL_PORTABLE_MMA 1
 #include "sm75_mma.cu"
 
 namespace {
-constexpr unsigned BM = 128, BN = 128, BK = 64, THREADS = 128;
+constexpr unsigned BM = 128, BN = 128, BK = 64;
+#if __CUDA_ARCH__ < 800
+constexpr unsigned THREADS = 256, ACC_ROWS = 4;
+#else
+constexpr unsigned THREADS = 128, ACC_ROWS = 8;
+#endif
+constexpr unsigned LOADS = (BM + BN) * BK / 16 / THREADS;
 constexpr unsigned WORDS = (BM + BN) * BK / 4;
 constexpr unsigned RECORD_WORDS = 26;
 
@@ -21,9 +28,9 @@ __device__ __forceinline__ uint32_t operand(const uint32_t* s, unsigned row, uns
 
 __device__ __forceinline__ void stage_load(
     const int8_t* a, const int8_t* b, unsigned k, unsigned row0, unsigned col0,
-    unsigned kk, uint32_t* out, uint4 (&prefetch)[8]) {
+    unsigned kk, uint32_t* out, uint4 (&prefetch)[LOADS]) {
 #pragma unroll
-  for (unsigned q = 0; q < 8; ++q) {
+  for (unsigned q = 0; q < LOADS; ++q) {
     const unsigned vector = threadIdx.x + q * THREADS;
     const unsigned row = vector / 4, kw = (vector % 4) * 4;
     const int8_t* src = row < BM ? a + size_t(row0 + row) * k + kk + kw * 4
@@ -40,12 +47,12 @@ __device__ __forceinline__ void stage_load(
 #endif
 }
 
-__device__ __forceinline__ void stage_ready(uint32_t* out, const uint4 (&prefetch)[8]) {
+__device__ __forceinline__ void stage_ready(uint32_t* out, const uint4 (&prefetch)[LOADS]) {
 #if __CUDA_ARCH__ >= 800
   asm volatile("cp.async.wait_group 0;" ::: "memory");
 #else
 #pragma unroll
-  for (unsigned q = 0; q < 8; ++q) {
+  for (unsigned q = 0; q < LOADS; ++q) {
     const unsigned vector = threadIdx.x + q * THREADS;
     *reinterpret_cast<uint4*>(out + smem_word(vector / 4, (vector % 4) * 4)) = prefetch[q];
   }
@@ -54,7 +61,14 @@ __device__ __forceinline__ void stage_ready(uint32_t* out, const uint4 (&prefetc
 }
 }
 
-extern "C" __global__ __launch_bounds__(128, 1)
+#if __CUDA_ARCH__ < 800
+#define PRODUCTION_THREADS 256
+#define PRODUCTION_BLOCKS 2
+#else
+#define PRODUCTION_THREADS 128
+#define PRODUCTION_BLOCKS 1
+#endif
+extern "C" __global__ __launch_bounds__(PRODUCTION_THREADS, PRODUCTION_BLOCKS)
 void pearl_production_scan(const int8_t* a, const int8_t* bt,
     unsigned m, unsigned n, unsigned k, unsigned rank,
     unsigned begin, unsigned band, const uint8_t* seed, const uint32_t* bound,
@@ -69,11 +83,11 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
   const unsigned row0 = (first_row + local % band_rows) * BM;
   const unsigned col0 = (local / band_rows) * BN;
   const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const unsigned wr = (warp / 2) * 64, wc = (warp % 2) * 64;
+  const unsigned wr = (warp / 2) * (ACC_ROWS * 8), wc = (warp % 2) * 64;
   const unsigned group = lane / 4, pair = lane % 4;
-  int32_t acc[8][8][2] = {};
+  int32_t acc[ACC_ROWS][8][2] = {};
   uint32_t transcript[16] = {};
-  uint4 prefetch[8];
+  uint4 prefetch[LOADS];
   stage_load(a, bt, k, row0, col0, 0, stages[0], prefetch);
   stage_ready(stages[0], prefetch);
   for (unsigned kk = 0; kk < k; kk += BK) {
@@ -110,14 +124,15 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
 #else
 #pragma unroll
     for (unsigned sk = 0; sk < BK; sk += 16) {
-      uint32_t af[8], bf[8];
+      uint32_t af[ACC_ROWS], bf[8];
 #pragma unroll
-      for (unsigned i = 0; i < 8; ++i) {
+      for (unsigned i = 0; i < ACC_ROWS; ++i)
         af[i] = operand(s, wr + i * 8 + group, sk + pair * 4);
-        bf[i] = operand(s, BM + wc + i * 8 + group, sk + pair * 4);
-      }
 #pragma unroll
-      for (unsigned i = 0; i < 8; ++i)
+      for (unsigned j = 0; j < 8; ++j)
+        bf[j] = operand(s, BM + wc + j * 8 + group, sk + pair * 4);
+#pragma unroll
+      for (unsigned i = 0; i < ACC_ROWS; ++i)
 #pragma unroll
         for (unsigned j = 0; j < 8; ++j) mma_int8(acc[i][j], af[i], bf[j]);
     }
@@ -127,7 +142,7 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
 #pragma unroll
       for (unsigned j = 0; j < 8; ++j)
 #pragma unroll
-        for (unsigned i = 0; i < 8; ++i) fold[j] ^= uint32_t(acc[i][j][0]) ^ uint32_t(acc[i][j][1]);
+        for (unsigned i = 0; i < ACC_ROWS; ++i) fold[j] ^= uint32_t(acc[i][j][0]) ^ uint32_t(acc[i][j][1]);
       uint32_t x = 0;
 #pragma unroll
       for (unsigned j = 0; j < 8; ++j) x ^= fold[j];
@@ -147,6 +162,21 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
     for (int i = 15; i > 0; --i) transcript[i] = transcript[i - 1];
     transcript[0] = last;
   }
+#if __CUDA_ARCH__ < 800
+  // XOR and rotation are linear: merging the two 4x16 transcripts here gives
+  // exactly the original 8x16 transcript, without a barrier at each milestone.
+  // All matrix readers finished at the final loop barrier. Reuse stage storage.
+  if (warp & 2) {
+#pragma unroll
+    for (unsigned i = 0; i < 16; ++i)
+      stages[0][(threadIdx.x - 64) * 16 + i] = transcript[i];
+  }
+  __syncthreads();
+  if (warp & 2) return;
+#pragma unroll
+  for (unsigned i = 0; i < 16; ++i)
+    transcript[i] ^= stages[0][threadIdx.x * 16 + i];
+#endif
   uint8_t digest[32];
   blake3_jackpot_hash(transcript, seed, digest);
   bool wins = true;

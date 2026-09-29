@@ -50,9 +50,14 @@ using std::min;
 struct Dim { unsigned x; } blockIdx;
 thread_local Dim threadIdx;
 struct alignas(16) uint4 { uint32_t x,y,z,w; };
-std::barrier cta_barrier(128);
-std::array<std::unique_ptr<std::barrier<>>,4> warp_barriers;
-struct Fragment { uint32_t a[4],b[2]; } fragments[128];
+#if __CUDA_ARCH__ < 800
+constexpr unsigned EMU_THREADS = 256;
+#else
+constexpr unsigned EMU_THREADS = 128;
+#endif
+std::barrier cta_barrier(EMU_THREADS);
+std::array<std::unique_ptr<std::barrier<>>,EMU_THREADS/32> warp_barriers;
+struct Fragment { uint32_t a[4],b[2]; } fragments[EMU_THREADS];
 inline void __syncthreads() { cta_barrier.arrive_and_wait(); }
 inline unsigned atomicAdd(unsigned* p, unsigned v) { return std::atomic_ref(*p).fetch_add(v); }
 inline unsigned __funnelshift_r(unsigned a, unsigned b, unsigned s) { return (a>>s)|(b<<(32-s)); }
@@ -88,8 +93,8 @@ main = r'''
 int main() {
   for(auto &b:warp_barriers) b=std::make_unique<std::barrier<>>(32);
   // Two stages, residual transcript rotation, wrap at slot 16, and a nonzero
-  // begin in a partial raster band. Full 32-slice production K is covered on GPU.
-  for(unsigned k: {128u,2176u}) {
+  // begin in a partial raster band, and the full 32-slice production K.
+  for(unsigned k: {128u,2176u,4096u}) {
     const unsigned m=256,n=384,begin=5,band=4,rank=128;
     std::mt19937 rng(17+k); std::vector<int8_t>a(m*k),b(n*k);
     for(auto &x:a) x=int(rng()%255)-127;
@@ -100,7 +105,7 @@ int main() {
     auto run=[&](unsigned capacity) {
       count=0; blockIdx.x=0;
       std::vector<std::thread> threads;
-      for(unsigned t=0;t<128;++t) threads.emplace_back([&,t] {
+      for(unsigned t=0;t<EMU_THREADS;++t) threads.emplace_back([&,t] {
         threadIdx.x=t;
         pearl_production_scan(a.data(),b.data(),m,n,k,rank,begin,band,seed,bound,capacity,&count,hits.data());
       });

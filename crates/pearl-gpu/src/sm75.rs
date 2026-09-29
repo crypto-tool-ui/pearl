@@ -488,8 +488,8 @@ impl ProductionCudaKernel {
         let groups_per_launch = u32::try_from(
             context.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         )?
-        .saturating_mul(4)
-        .clamp(32, 1024);
+        .saturating_mul(if architecture == KernelArchitecture::Sm75Mma { 16 } else { 4 })
+        .clamp(32, 4096);
         let scan = load_cuda_kernel(&context, cubin, "pearl_production_scan")?;
         let stream = context.default_stream();
         let scratch = RefCell::new(ScanScratch {
@@ -560,7 +560,7 @@ impl ProductionCudaKernel {
                 result::launch_kernel(
                     self.scan.function,
                     (groups, 1, 1),
-                    (128, 1, 1),
+                    (if self.architecture == KernelArchitecture::Sm75Mma { 256 } else { 128 }, 1, 1),
                     0,
                     stream.cu_stream(),
                     &mut args,
