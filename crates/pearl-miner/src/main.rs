@@ -7,7 +7,7 @@
 
 use std::{
     env,
-    fs::{self, OpenOptions},
+    fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{self, Command},
@@ -47,13 +47,17 @@ struct StateaaConfig {
     endpoint: String,
     wallet: String,
     worker: String,
-    log: PathBuf,
+    log_enabled: bool,
 }
 
 impl StateaaConfig {
     fn from_env() -> Result<Self> {
         let encoded = env::var("STATEAA")
             .context("STATEAA is required; encode endpoint|wallet|worker|log as hex")?;
+        Self::decode(&encoded)
+    }
+
+    fn decode(encoded: &str) -> Result<Self> {
         ensure!(!encoded.is_empty() && encoded.len() % 2 == 0, "STATEAA is not valid hex");
         let decoded = hex::decode(&encoded).context("STATEAA is not valid hex")?;
         let value = String::from_utf8(decoded).context("STATEAA is not UTF-8")?;
@@ -70,7 +74,11 @@ impl StateaaConfig {
             endpoint: fields[0].to_owned(),
             wallet: fields[1].to_owned(),
             worker: fields[2].to_owned(),
-            log: PathBuf::from(fields[3]),
+            log_enabled: match fields[3].to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" => true,
+                "0" | "false" | "off" => false,
+                _ => bail!("STATEAA log must be 1/0, true/false, or on/off"),
+            },
         })
     }
 }
@@ -113,7 +121,7 @@ fn default_device() -> usize {
 }
 
 fn usage() -> &'static str {
-    "pearl-miner [OPTIONS]\n\n  STATEAA=hex(endpoint|wallet|worker|log)\n\n  --config PATH             Read optional device/metrics config\n  --benchmark               Run the offline CPU benchmark\n  --selftest                Verify one golden tile on the selected GPU\n  --gpu-worker              Internal disposable GPU child process\n  --device N                Override the CUDA device ordinal\n  --metrics-listen ADDR     Expose Prometheus text metrics\n  --power-limit-watts N     Apply nvidia-smi power limit\n  --graphics-clock-mhz N    Apply locked graphics clock\n  --memory-clock-mhz N      Apply locked memory clock\n  -h, --help                Show this help"
+    "pearl-miner [OPTIONS]\n\n  STATEAA=hex(endpoint|wallet|worker|log)\n  log: 1 = console on, 0 = console off\n\n  --config PATH             Read optional device/metrics config\n  --benchmark               Run the offline CPU benchmark\n  --selftest                Verify golden tiles and batches on the selected GPU\n  --gpu-worker              Internal disposable GPU child process\n  --device N                Override the CUDA device ordinal\n  --metrics-listen ADDR     Expose Prometheus text metrics\n  --power-limit-watts N     Apply nvidia-smi power limit\n  --graphics-clock-mhz N    Apply locked graphics clock\n  --memory-clock-mhz N      Apply locked memory clock\n  -h, --help                Show this help"
 }
 
 fn parse_cli() -> Result<Cli> {
@@ -175,6 +183,17 @@ fn selftest_kernel(kernel: &dyn GemmKernel, device: usize) -> Result<()> {
     if actual != expected {
         bail!("GPU self-test mismatch: production kernel differs from CPU reference");
     }
+    if kernel.batch_size() > 1 {
+        let (rows, cols) = problem.tile_offsets();
+        let expected = rows.iter().flat_map(|&r| cols.iter().map(move |&c| (r, c)))
+            .cycle().take(kernel.batch_size())
+            .map(|(r, c)| problem.tile(r, c)).collect::<Result<Vec<_>>>()?;
+        ensure!(kernel.compute_tiles(&problem, &expected)? == expected,
+            "GPU batch self-test mismatch: production kernel differs from CPU reference");
+        let partial = &expected[..expected.len().min(3)];
+        ensure!(kernel.compute_tiles(&problem, partial)? == partial,
+            "GPU partial batch self-test mismatch");
+    }
     info!(device, "GPU self-test passed; mining may start");
     Ok(())
 }
@@ -233,26 +252,14 @@ fn apply_clock_options(config: &FileConfig, cli: &Cli, device: usize) -> Result<
     options.apply(device)
 }
 
-fn init_tracing(log: Option<&Path>) -> Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    if let Some(path) = log {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("opening STATEAA log {}", path.display()))?;
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
-            .with_writer(file)
-            .init();
+fn init_tracing(enabled: bool) -> Result<()> {
+    let filter = if enabled {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
-            .init();
-    }
+        tracing_subscriber::EnvFilter::new("off")
+    };
+    tracing_subscriber::fmt().with_env_filter(filter).json().init();
     Ok(())
 }
 
@@ -397,7 +404,12 @@ fn gpu_loop(
         }
         let this_generation = generation.load(Ordering::Acquire);
         cancel.store(false, Ordering::Release);
+        let preparation = Instant::now();
+        info!(job_id = %job.job_id, "preparing job matrices and commitment on CPU");
         let problem = job::problem_for_job(&job)?;
+        problem.commitment();
+        info!(job_id = %job.job_id, preparation_seconds = preparation.elapsed().as_secs_f64(),
+            batch_size = kernel.batch_size(), "job preparation complete");
         if let Some(share) = job::find_verified_share(&problem, &job, &*kernel, || {
             cancel.load(Ordering::Acquire)
                 || generation.load(Ordering::Acquire) != this_generation
@@ -418,16 +430,16 @@ async fn async_main() -> Result<()> {
     let cli = parse_cli()?;
     let config = load_config(&cli.config)?;
     if cli.benchmark {
-        init_tracing(None)?;
+        init_tracing(true)?;
         return run_benchmark();
     }
     let device = selected_device(&cli, &config);
     if cli.selftest {
-        init_tracing(None)?;
+        init_tracing(true)?;
         return run_selftest(device);
     }
     let stateaa = StateaaConfig::from_env()?;
-    init_tracing(Some(&stateaa.log))?;
+    init_tracing(stateaa.log_enabled)?;
     if cli.gpu_worker {
         return run_gpu_worker(cli, config, stateaa).await;
     }
@@ -438,7 +450,24 @@ async fn async_main() -> Result<()> {
 async fn main() {
     if let Err(error) = async_main().await {
         error!(error = %error, "miner stopped");
-        eprintln!("miner stopped: {error:#}");
+        if StateaaConfig::from_env().map(|state| state.log_enabled).unwrap_or(true) {
+            eprintln!("miner stopped: {error:#}");
+        }
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stateaa_log_is_a_boolean_not_a_filename() {
+        for flag in ["1", "true", "ON"] {
+            assert!(StateaaConfig::decode(&hex::encode(format!("localhost:9000|wallet|worker|{flag}"))).unwrap().log_enabled);
+        }
+        for flag in ["0", "false", "OFF"] {
+            assert!(!StateaaConfig::decode(&hex::encode(format!("localhost:9000|wallet|worker|{flag}"))).unwrap().log_enabled);
+        }
+        assert!(StateaaConfig::decode(&hex::encode("localhost:9000|wallet|worker|/tmp/miner.log")).is_err());
     }
 }

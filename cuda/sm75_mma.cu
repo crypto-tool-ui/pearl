@@ -5,6 +5,7 @@
 #error "sm75_mma.cu must be compiled for sm_75"
 #endif
 #include <stdint.h>
+#include <stddef.h>
 namespace {
 __device__ __constant__ const uint32_t kBlake3Iv[8] = {
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
@@ -101,6 +102,10 @@ extern "C" __global__ void pearl_sm75_mma_tile(
     uint32_t padded_h, uint32_t padded_w,
     uint32_t physical_k, uint32_t effective_k, uint32_t rank,
     uint32_t* transcript, const uint8_t* a_noise_seed, uint8_t* digest) {
+  a += static_cast<size_t>(blockIdx.x) * padded_h * physical_k;
+  bt += static_cast<size_t>(blockIdx.x) * padded_w * physical_k;
+  transcript += blockIdx.x * 16;
+  digest += blockIdx.x * 32;
   // Uniform checks: every thread in this CTA reaches every block barrier.
   const uint32_t warps = (padded_h / 8) * (padded_w / 8);
   if (!logical_h || !logical_w || logical_h > padded_h || logical_w > padded_w ||

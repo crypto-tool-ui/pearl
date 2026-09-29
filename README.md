@@ -6,7 +6,11 @@ sm_120a `mma.sync` on RTX PRO 6000 Blackwell. The sm_90a WGMMA kernel is built,
 but H100/H200 mining dispatch remains blocked pending hardware acceptance. A job advertising V4 or an unknown certificate version is paused with `update required`.
 
 Mining credentials are supplied only through `STATEAA`, encoded as
-`hex(endpoint|wallet|worker|log)`. Use the endpoint currently published by
+`hex(endpoint|wallet|worker|log)`. The last field is a console toggle: `1`/`true`/`on`
+enables logs; `0`/`false`/`off` disables them, even if `RUST_LOG` is set. It is not
+a filename and no log file is created. Python tunnel logging is independent
+(`LOG_LEVEL=ERROR` suppresses its informational snapshots).
+Use the endpoint currently published by
 [Kryptex](https://pool.kryptex.com/prl). The decoded value is never logged.
 
 For `proxy/` + `tunel.py`, use `localhost:9000` (or `tunnel://localhost:9000`).
@@ -39,14 +43,14 @@ cp config.example.toml config.toml
 cargo run --release -p pearl-miner -- --selftest
 ```
 
-The self-test must pass before the daemon is started. It compares one production-kernel tile with
+The self-test must pass before the daemon is started. It compares production-kernel tiles (including full and partial T4 batches) with
 the CPU reference and exits on any mismatch. The daemon uses a disposable `--gpu-worker` child so a
 driver failure stops mining without allowing an unverified share to reach the network.
 
 ## Run from environment
 
 ```sh
-export STATEAA="$(printf '%s' 'localhost:9000|YOUR_WALLET|worker-1|/var/log/pearl-miner.jsonl' | xxd -p -c 9999)"
+export STATEAA="$(printf '%s' 'localhost:9000|YOUR_WALLET|worker-1|1' | xxd -p -c 9999)"
 ./target/release/pearl-miner
 ```
 
@@ -60,7 +64,7 @@ cargo build --release -p pearl-miner
 sudo install -Dm755 target/release/pearl-miner /usr/local/bin/pearl-miner
 sudo install -Dm644 config.example.toml /etc/pearl-miner/config.toml
 sudo install -Dm644 systemd/pearl-miner.service /etc/systemd/system/pearl-miner.service
-printf 'STATEAA=%s\n' "$(printf '%s' 'stratum+ssl://prl-us.kryptex.network:8048|YOUR_WALLET|worker-1|/var/log/pearl-miner.jsonl' | xxd -p -c 9999)" | sudo tee /etc/pearl-miner/stateaa.env >/dev/null
+printf 'STATEAA=%s\n' "$(printf '%s' 'stratum+ssl://prl-us.kryptex.network:8048|YOUR_WALLET|worker-1|1' | xxd -p -c 9999)" | sudo tee /etc/pearl-miner/stateaa.env >/dev/null
 sudo chmod 600 /etc/pearl-miner/stateaa.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now pearl-miner
@@ -72,7 +76,7 @@ The GPU self-test runs before mining. Local transport tests do not establish liv
 
 ```sh
 docker build -t pearl-miner:cuda13 .
-export STATEAA="$(printf '%s' 'stratum+ssl://prl-us.kryptex.network:8048|YOUR_WALLET|worker-1|/var/log/pearl-miner.jsonl' | xxd -p -c 9999)"
+export STATEAA="$(printf '%s' 'stratum+ssl://prl-us.kryptex.network:8048|YOUR_WALLET|worker-1|1' | xxd -p -c 9999)"
 docker run --rm --gpus all --env RUST_LOG=info --env STATEAA="$STATEAA" -v "$PWD/config.toml:/etc/pearl-miner/config.toml:ro" pearl-miner:cuda13
 ```
 
@@ -160,3 +164,9 @@ both CPU and naive CUDA, and prints a tile benchmark. This path has been compile
 and its IMMA instruction verified; GPU correctness, hashrate and pool acceptance
 remain unverified until those hardware checks run. This is an initial T4 path,
 not a claim of maximum mining throughput.
+
+T4 mining submits up to 128 tiles per CUDA launch (one block per tile), sharing
+CPU noise generation across the batch and transferring results together. The
+miner reports job preparation time and mining progress every ten seconds when
+console logging is enabled. CPU matrix/commitment preparation still precedes GPU
+work; batching does not guarantee any particular utilization or hashrate.

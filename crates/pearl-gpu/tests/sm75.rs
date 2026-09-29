@@ -218,3 +218,31 @@ fn sm75_mma_benchmark() {
         device_name
     );
 }
+
+#[test]
+fn sm75_batches_match_cpu_across_blocks_and_partial_batches() {
+    if option_env!("PEARL_SM75_MMA_CUBIN").is_none() {
+        skip_gpu("sm_75 batch cubin unavailable");
+        return;
+    }
+    let kernel = match std::panic::catch_unwind(|| MmaSm75CudaKernel::new(gpu_ordinal())) {
+        Ok(Ok(kernel)) => kernel,
+        _ => { skip_gpu("sm_75 GPU unavailable"); return; }
+    };
+    let problem = test_problem().unwrap();
+    let (rows, cols) = problem.tile_offsets();
+    let expected: Vec<_> = rows.iter().flat_map(|&r| cols.iter().map(move |&c| (r,c)))
+        .take(128).map(|(r,c)| problem.tile(r,c).unwrap()).collect();
+    for count in [1, 3, 127, 128] {
+        let batch: Vec<_> = expected.iter().rev().cycle().take(count).cloned().collect();
+        assert_eq!(kernel.compute_tiles(&problem, &batch).unwrap(), batch);
+    }
+    assert!(kernel.compute_tiles(&problem, &[]).unwrap().is_empty());
+    let batch: Vec<_> = expected.iter().cycle().take(129).cloned().collect();
+    assert!(kernel.compute_tiles(&problem, &batch).is_err());
+    let batch: Vec<_> = expected.iter().cycle().take(128).cloned().collect();
+    let start = Instant::now();
+    for _ in 0..16 { kernel.compute_tiles(&problem, &batch).unwrap(); }
+    println!("sm_75 batched benchmark: {:.2} tiles/s (128 blocks/launch, includes CPU noise and copies)",
+        2048.0 / start.elapsed().as_secs_f64());
+}

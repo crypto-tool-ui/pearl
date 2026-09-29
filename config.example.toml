@@ -1,5 +1,5 @@
-# Pool endpoint, wallet, worker, and log file come only from STATEAA.
-# Example: printf '%s' 'stratum+ssl://prl-us.kryptex.network:8048|YOUR_WALLET|worker-1|/var/log/pearl-miner.jsonl' | xxd -p -c 9999
+# Pool endpoint, wallet, worker, and console log toggle come only from STATEAA.
+# Example: printf '%s' 'stratum+ssl://prl-us.kryptex.network:8048|YOUR_WALLET|worker-1|1' | xxd -p -c 9999
 
 [mining]
 device = 0

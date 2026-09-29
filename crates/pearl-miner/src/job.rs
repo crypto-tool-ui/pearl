@@ -40,37 +40,39 @@ pub fn find_verified_share(
     let mut scanned = 0usize;
     let started = Instant::now();
 
-    for t_rows in row_offsets {
-        for t_cols in &col_offsets {
-            if should_cancel() {
-                warn!(job_id = %job.job_id, scanned, "Kryptex job cancelled as stale");
-                return Ok(None);
-            }
-            let request = problem.empty_tile(t_rows, *t_cols)?;
-            let tile = kernel
-                .compute_tile(problem, &request)
-                .with_context(|| format!("computing Kryptex tile ({t_rows},{t_cols})"))?;
-            scanned += 1;
-            if U256::from_little_endian(&tile.digest) > bound {
-                continue;
-            }
-            debug!(job_id = %job.job_id, t_rows, t_cols, scanned, "GPU candidate reached share bound");
-            let elapsed = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
-            let operations = (scanned as u128)
-                .saturating_mul(problem.m as u128)
-                .saturating_mul(problem.n as u128)
-                .saturating_mul(problem.k() as u128);
-            let hashrate = (operations as f64 / elapsed)
-                .min(u64::MAX as f64)
-                .max(0.0) as u64;
-            let share = VerifiedShare::from_verified_tile_with_hashrate(
-                problem,
-                job,
-                &tile,
-                hashrate,
-            )
+    let mut offsets = row_offsets.into_iter().flat_map(|row| col_offsets.iter().copied().map(move |col| (row, col)));
+    let mut last_report = Instant::now();
+    loop {
+        if should_cancel() {
+            warn!(job_id = %job.job_id, scanned, "Kryptex job cancelled as stale");
+            return Ok(None);
+        }
+        let requests = offsets.by_ref().take(kernel.batch_size())
+            .map(|(row, col)| problem.empty_tile(row, col)).collect::<Result<Vec<_>>>()?;
+        if requests.is_empty() { break; }
+        let tiles = kernel.compute_tiles(problem, &requests).context("computing Kryptex tile batch")?;
+        ensure!(tiles.len() == requests.len(), "GPU returned an incomplete tile batch");
+        if should_cancel() { return Ok(None); }
+        scanned += tiles.len();
+        let elapsed = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+        // Count the logical cells actually computed, not the dimensions of the entire job.
+        let per_tile = requests[0].rows.len() as f64 * requests[0].cols.len() as f64 * problem.k() as f64;
+        let hashrate = (scanned as f64 * per_tile / elapsed).min(u64::MAX as f64) as u64;
+        if last_report.elapsed().as_secs() >= 10 {
+            info!(job_id = %job.job_id, scanned, batch = tiles.len(),
+                tiles_per_second = scanned as f64 / elapsed, hashrate,
+                "mining progress");
+            last_report = Instant::now();
+        }
+        for tile in tiles {
+            if should_cancel() { return Ok(None); }
+            if U256::from_little_endian(&tile.digest) > bound { continue; }
+            debug!(job_id = %job.job_id, t_rows = tile.t_rows, t_cols = tile.t_cols, scanned,
+                "GPU candidate reached share bound");
+            let share = VerifiedShare::from_verified_tile_with_hashrate(problem, job, &tile, hashrate)
                 .context("CPU reference rejected GPU candidate")?;
-            info!(job_id = %job.job_id, t_rows, t_cols, scanned, "CPU-verified Kryptex share ready");
+            info!(job_id = %job.job_id, t_rows = tile.t_rows, t_cols = tile.t_cols, scanned,
+                "CPU-verified Kryptex share ready");
             return Ok(Some(share));
         }
     }

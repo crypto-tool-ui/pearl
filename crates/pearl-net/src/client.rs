@@ -733,5 +733,5 @@ fn classify_reject(reason: &str) -> RejectKind {
 }
 
 fn tracing_error(error: &anyhow::Error) {
-    eprintln!("pool reconnect failed: {error:#}");
+    tracing::warn!(error = %format!("{error:#}"), "pool reconnect failed");
 }

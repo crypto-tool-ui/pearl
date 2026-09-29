@@ -213,51 +213,45 @@ impl Problem {
     /// operand addition remain the official reference implementation; CUDA only performs the
     /// resulting i8 dot products and transcript fold.
     pub fn noised_tile_operands(&self, tile: &TileResult) -> Result<(Vec<i8>, Vec<i8>)> {
-        ensure!(
-            tile.rows == self.config.rows_pattern.indices_with_offset(tile.t_rows),
-            "tile rows do not match problem"
-        );
-        ensure!(
-            tile.cols == self.config.cols_pattern.indices_with_offset(tile.t_cols),
-            "tile cols do not match problem"
-        );
+        Ok(self.noised_tiles_operands(std::slice::from_ref(tile))?.remove(0))
+    }
 
+    /// Generate official noise once for the union of rows/columns in a bounded batch.
+    /// Repeated A rows and the K-wide permutations are reused across adjacent tiles.
+    pub fn noised_tiles_operands(&self, tiles: &[TileResult]) -> Result<Vec<(Vec<i8>, Vec<i8>)>> {
+        use std::collections::BTreeSet;
+        if tiles.is_empty() { return Ok(Vec::new()); }
+        let mut rows = BTreeSet::new();
+        let mut cols = BTreeSet::new();
+        for tile in tiles {
+            ensure!(tile.rows == self.config.rows_pattern.indices_with_offset(tile.t_rows), "tile rows do not match problem");
+            ensure!(tile.cols == self.config.cols_pattern.indices_with_offset(tile.t_cols), "tile cols do not match problem");
+            ensure!(tile.rows.iter().all(|&r| r < self.m) && tile.cols.iter().all(|&c| c < self.n), "tile indices out of bounds");
+            rows.extend(tile.rows.iter().map(|&r| r as usize));
+            cols.extend(tile.cols.iter().map(|&c| c as usize));
+        }
+        let rows: Vec<usize> = rows.into_iter().collect();
+        let cols: Vec<usize> = cols.into_iter().collect();
         let commitment = self.commitment();
-        let row_indices: Vec<usize> = tile.rows.iter().map(|&row| row as usize).collect();
-        let col_indices: Vec<usize> = tile.cols.iter().map(|&col| col as usize).collect();
-        let noise = compute_noise_for_indices(
-            self.k(),
-            self.config.rank as usize,
-            (commitment.b_noise_seed, commitment.a_noise_seed),
-            &row_indices,
-            &col_indices,
-        );
-
-        let mut a = Vec::with_capacity(tile.rows.len() * self.k());
-        for (u, &row) in tile.rows.iter().enumerate() {
-            for l in 0..self.k() {
-                let value = self.a[row as usize * self.k() + l] as i32 + noise.a[u][l] as i32;
-                ensure!(
-                    (-128..=127).contains(&value),
-                    "noised A value does not fit i8"
-                );
-                a.push(value as i8);
-            }
-        }
-
-        let mut bt = Vec::with_capacity(tile.cols.len() * self.k());
-        for (v, &col) in tile.cols.iter().enumerate() {
-            for l in 0..self.k() {
-                let value = self.bt[col as usize * self.k() + l] as i32 + noise.b[v][l] as i32;
-                ensure!(
-                    (-128..=127).contains(&value),
-                    "noised B^T value does not fit i8"
-                );
-                bt.push(value as i8);
-            }
-        }
-
-        Ok((a, bt))
+        let noise = compute_noise_for_indices(self.k(), self.config.rank as usize,
+            (commitment.b_noise_seed, commitment.a_noise_seed), &rows, &cols);
+        let combine = |indices: &[usize], matrix: &[i8], noise: &[Vec<i8>]| -> Result<Vec<Vec<i8>>> {
+            indices.iter().zip(noise).map(|(&index, row_noise)| {
+                matrix[index * self.k()..(index + 1) * self.k()].iter().zip(row_noise)
+                    .map(|(&v, &n)| {
+                        let value = v as i32 + n as i32;
+                        ensure!((-128..=127).contains(&value), "noised operand does not fit i8");
+                        Ok(value as i8)
+                    }).collect()
+            }).collect()
+        };
+        let a = combine(&rows, &self.a, &noise.a)?;
+        let bt = combine(&cols, &self.bt, &noise.b)?;
+        Ok(tiles.iter().map(|tile| {
+            let selected_a = tile.rows.iter().flat_map(|&r| a[rows.binary_search(&(r as usize)).unwrap()].iter().copied()).collect();
+            let selected_bt = tile.cols.iter().flat_map(|&c| bt[cols.binary_search(&(c as usize)).unwrap()].iter().copied()).collect();
+            (selected_a, selected_bt)
+        }).collect())
     }
 
     /// Computes one tile in the official reference order.
@@ -538,6 +532,34 @@ pub fn test_header_variant(problem: &Problem, timestamp: u32) -> Result<Problem>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_operands_match_official_noise_for_each_tile() {
+        let problem = test_problem().unwrap();
+        let (rows, cols) = problem.tile_offsets();
+        let tiles: Vec<_> = rows.iter().take(3).flat_map(|&r| cols.iter().take(5).map(move |&c| (r,c)))
+            .map(|(r,c)| problem.empty_tile(r,c).unwrap()).collect();
+        let batch = problem.noised_tiles_operands(&tiles).unwrap();
+        let commitment = problem.commitment();
+        for (tile, (a, bt)) in tiles.iter().zip(batch) {
+            let rows: Vec<_> = tile.rows.iter().map(|&v| v as usize).collect();
+            let cols: Vec<_> = tile.cols.iter().map(|&v| v as usize).collect();
+            let noise = compute_noise_for_indices(problem.k(), problem.config.rank as usize,
+                (commitment.b_noise_seed, commitment.a_noise_seed), &rows, &cols);
+            for (actual, indices, matrix, noise) in [(&a, &rows, &problem.a, &noise.a), (&bt, &cols, &problem.bt, &noise.b)] {
+                for (i, &index) in indices.iter().enumerate() {
+                    for k in 0..problem.k() {
+                        assert_eq!(actual[i * problem.k() + k] as i32,
+                            matrix[index * problem.k() + k] as i32 + noise[i][k] as i32);
+                    }
+                }
+            }
+        }
+        assert!(problem.noised_tiles_operands(&[]).unwrap().is_empty());
+        let mut bad = tiles[0].clone();
+        bad.rows[0] += 1;
+        assert!(problem.noised_tiles_operands(&[bad]).is_err());
+    }
 
     #[test]
     fn official_verifier_accepts_reference_tile_and_rejects_header_mutation() {

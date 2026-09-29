@@ -81,6 +81,7 @@ impl MmaSm75CudaKernel {
     fn padded_operands(
         problem: &Problem,
         tile: &TileResult,
+        operands: (Vec<i8>, Vec<i8>),
     ) -> Result<(Vec<i8>, Vec<i8>, u32, u32)> {
         ensure!(
             problem.config.mma_type == MMAType::Int7xInt7ToInt32,
@@ -90,7 +91,7 @@ impl MmaSm75CudaKernel {
             problem.config.moe.is_none(),
             "sm_75 dense kernel does not support grouped GEMM"
         );
-        let (a, bt) = problem.noised_tile_operands(tile)?;
+        let (a, bt) = operands;
         let h = tile.rows.len();
         let w = tile.cols.len();
         let k = problem.k();
@@ -154,7 +155,9 @@ impl MmaSm75CudaKernel {
         effective_k: u32,
         rank: u32,
         a_noise_seed: &[u8; 32],
-    ) -> Result<([u32; 16], [u8; 32])> {
+        batch: usize,
+    ) -> Result<(Vec<u32>, Vec<u8>)> {
+        ensure!(batch > 0 && batch <= 128, "invalid sm_75 batch size");
         ensure!(rank > 0, "sm_75 kernel requires a nonzero rank");
         ensure!(
             logical_h > 0 && logical_w > 0,
@@ -170,9 +173,11 @@ impl MmaSm75CudaKernel {
         );
         let expected_a_len = (padded_h as usize)
             .checked_mul(physical_k as usize)
+            .and_then(|size| size.checked_mul(batch))
             .context("sm_75 A operand length overflow")?;
         let expected_bt_len = (padded_w as usize)
             .checked_mul(physical_k as usize)
+            .and_then(|size| size.checked_mul(batch))
             .context("sm_75 B^T operand length overflow")?;
         ensure!(
             a.len() == expected_a_len,
@@ -257,15 +262,15 @@ impl MmaSm75CudaKernel {
             .clone_htod(bt)
             .context("copying padded B^T tile to CUDA")?;
         let mut d_transcript = stream
-            .alloc_zeros::<u32>(16)
+            .alloc_zeros::<u32>(16 * batch)
             .context("allocating sm_75 transcript")?;
         let mut d_digest = stream
-            .alloc_zeros::<u8>(32)
+            .alloc_zeros::<u8>(32 * batch)
             .context("allocating sm_75 digest")?;
         let d_a_noise_seed = stream
             .clone_htod(a_noise_seed)
             .context("copying sm_75 A noise seed to CUDA")?;
-        (|| -> Result<([u32; 16], [u8; 32])> {
+        (|| -> Result<(Vec<u32>, Vec<u8>)> {
             {
                 let (a_ptr, _a_sync) = d_a.device_ptr(&stream);
                 let (bt_ptr, _bt_sync) = d_bt.device_ptr(&stream);
@@ -293,7 +298,7 @@ impl MmaSm75CudaKernel {
                 unsafe {
                     result::launch_kernel(
                         self.kernel.function,
-                        (1, 1, 1),
+                        (batch as u32, 1, 1),
                         (threads as u32, 1, 1),
                         shared_bytes as u32,
                         stream.cu_stream(),
@@ -307,14 +312,10 @@ impl MmaSm75CudaKernel {
                 .context("synchronizing pearl_sm75_mma_tile")?;
             let transcript = stream
                 .clone_dtoh(&d_transcript)
-                .context("copying sm_75 transcript from CUDA")?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("sm_75 transcript had the wrong length"))?;
+                .context("copying sm_75 transcript from CUDA")?;
             let digest = stream
                 .clone_dtoh(&d_digest)
-                .context("copying sm_75 digest from CUDA")?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("sm_75 digest had the wrong length"))?;
+                .context("copying sm_75 digest from CUDA")?;
             Ok((transcript, digest))
         })()
     }
@@ -329,36 +330,44 @@ impl GemmKernel for MmaSm75CudaKernel {
         }
     }
 
+    fn batch_size(&self) -> usize { 128 }
+
     fn compute_tile(&self, problem: &Problem, tile: &TileResult) -> Result<TileResult> {
-        let (a, bt, padded_h, padded_w) = Self::padded_operands(problem, tile)?;
+        Ok(self.compute_tiles(problem, std::slice::from_ref(tile))?.remove(0))
+    }
+
+    fn compute_tiles(&self, problem: &Problem, tiles: &[TileResult]) -> Result<Vec<TileResult>> {
+        if tiles.is_empty() { return Ok(Vec::new()); }
+        ensure!(tiles.len() <= self.batch_size(), "sm_75 batch exceeds 128 tiles");
+        let first = &tiles[0];
+        ensure!(tiles.iter().all(|t| t.rows.len() == first.rows.len() && t.cols.len() == first.cols.len()), "sm_75 batch tile shapes differ");
+        let operands = problem.noised_tiles_operands(tiles)?;
+        let mut a = Vec::new();
+        let mut bt = Vec::new();
+        let mut padded_h = 0;
+        let mut padded_w = 0;
+        for (tile, pair) in tiles.iter().zip(operands) {
+            let (tile_a, tile_bt, h, w) = Self::padded_operands(problem, tile, pair)?;
+            a.extend(tile_a);
+            bt.extend(tile_bt);
+            padded_h = h;
+            padded_w = w;
+        }
         let rank = problem.config.rank as usize;
         ensure!(rank > 0, "sm_75 kernel requires a nonzero rank");
         let effective_k = (problem.k() / rank) * rank;
         let commitment = problem.commitment();
-        let (transcript, digest) = self.launch_transcript(
-            &a,
-            &bt,
-            tile.rows.len() as u32,
-            tile.cols.len() as u32,
-            padded_h,
-            padded_w,
-            problem.k() as u32,
-            effective_k as u32,
-            rank as u32,
-            &commitment.a_noise_seed,
+        let (transcripts, digests) = self.launch_transcript(
+            &a, &bt, first.rows.len() as u32, first.cols.len() as u32,
+            padded_h, padded_w, problem.k() as u32, effective_k as u32,
+            rank as u32, &commitment.a_noise_seed, tiles.len(),
         )?;
-        let expected_digest = compute_jackpot_hash(&transcript, commitment.a_noise_seed);
-        ensure!(
-            digest == expected_digest,
-            "sm_75 fused BLAKE3 digest does not match the returned transcript"
-        );
-        Ok(TileResult {
-            t_rows: tile.t_rows,
-            t_cols: tile.t_cols,
-            rows: tile.rows.clone(),
-            cols: tile.cols.clone(),
-            transcript,
-            digest,
-        })
+        tiles.iter().enumerate().map(|(index, tile)| {
+            let transcript = transcripts[index * 16..(index + 1) * 16].try_into().unwrap();
+            let digest = digests[index * 32..(index + 1) * 32].try_into().unwrap();
+            ensure!(digest == compute_jackpot_hash(&transcript, commitment.a_noise_seed),
+                "sm_75 fused BLAKE3 digest does not match the returned transcript");
+            Ok(TileResult { transcript, digest, ..tile.clone() })
+        }).collect()
     }
 }
