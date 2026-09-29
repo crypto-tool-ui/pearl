@@ -31,7 +31,7 @@ use tokio::{
     net::TcpListener,
     sync::{mpsc, watch},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod job;
 mod logging;
@@ -202,6 +202,24 @@ fn selftest_kernel(kernel: &dyn GemmKernel, device: usize) -> Result<()> {
             "GPU partial batch self-test mismatch");
     }
     kernel.mining_selftest().context("production grouped mining self-test failed")?;
+    // Exercise an actual GPU candidate through proof construction and V2 serialization.
+    // The synthetic target is local only and is never sent to a pool.
+    let p = pearl_gpu::production_test_problem(128, 128, 4096)?;
+    kernel.prepare_job(&p)?;
+    let target = primitive_types::U256::MAX >> 19;
+    let mut target_be = [0; 32];
+    target.to_big_endian(&mut target_be);
+    let job = PoolJob { job_id: "local-gpu-proof-selftest".into(), header: p.header.to_bytes(),
+        target, target_be, height: None, difficulty: None, cert_version: Some(3) };
+    let mut bound = [0; 32];
+    pearl_ref::share_bound(target, &p.config).context("self-test bound")?.to_little_endian(&mut bound);
+    let tiles = kernel.scan_groups(&p, 0, 1, bound)?;
+    let tile = tiles.first().context("GPU proof self-test produced no candidate")?;
+    let share = pearl_net::VerifiedShare::from_verified_tile(&p, &job, tile)
+        .context("GPU candidate failed official proof verification")?;
+    KryptexProtocol::new("local-selftest".into(), "gpu".into(), "x".into(), KryptexMode::V2)
+        .submit(1, &share).context("GPU proof V2 encoding failed")?;
+    info!(device, "GPU候補・公式証明検証・V2エンコードの自己診断に合格しました");
     info!(device, "GPU自己診断に合格しました。マイニングを開始できます");
     Ok(())
 }
@@ -264,6 +282,15 @@ fn run_gpu_benchmark(device: usize) -> Result<()> {
     println!("GPUベンチマーク {:?}: {:.3} TH/s (MAC/s) | {:.2} tiles/s | 準備={:.3}秒 | 計測={:.3}秒 | 起動回数={} | M={} N={} K={} | シェア証明と準備時間を除外",
         kernel.metadata().architecture, scanned as f64 * 128.0 * problem.k() as f64 / seconds / 1e12,
         scanned as f64 / seconds, prep_seconds, seconds, launches, problem.m, problem.n, problem.k());
+    println!("PEARL_BENCHMARK_JSON {}", serde_json::json!({
+        "architecture": format!("{:?}", kernel.metadata().architecture),
+        "device": device, "m": problem.m, "n": problem.n, "k": problem.k(),
+        "groups_per_launch": batch, "tiles": scanned, "launches": launches,
+        "scan_seconds": seconds, "prep_seconds": prep_seconds,
+        "th_s": scanned as f64 * 128.0 * problem.k() as f64 / seconds / 1e12,
+        "includes": "kernel + launch + target upload + result readback",
+        "excludes": "matrix preparation + proof + pool"
+    }));
     Ok(())
 }
 
@@ -275,7 +302,7 @@ async fn metrics_server(addr: SocketAddr, mut stop: watch::Receiver<bool>) -> Re
             _ = stop.changed() => return Ok(()),
             result = listener.accept() => {
                 let (mut socket, _) = result.context("accepting metrics connection")?;
-                let body = "# TYPE pearl_up gauge\npearl_up 1\n# TYPE pearl_shares_accepted counter\npearl_shares_accepted 0\n";
+                let body = "# TYPE pearl_up gauge\npearl_up 1\n";
                 let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                 socket.write_all(response.as_bytes()).await.context("writing metrics response")?;
             }
@@ -335,6 +362,7 @@ async fn run_daemon(cli: Cli, config: FileConfig) -> Result<()> {
     if let Some(task) = metrics_task {
         let _ = task.await;
     }
+    ensure!(status.success(), "GPU worker exited with {status}");
     Ok(())
 }
 
@@ -387,8 +415,18 @@ async fn run_gpu_worker(cli: Cli, config: FileConfig, stateaa: StateaaConfig) ->
     });
     info!(device, "Kryptexに接続しました。通信処理とGPUワーカーを開始しました");
 
+    let mut submitted = 0u64;
+    let mut accepted = 0u64;
+    let mut rejected = 0u64;
+    let mut stale = 0u64;
+    let mut share_report = tokio::time::interval(std::time::Duration::from_secs(30));
+    share_report.reset();
+    let outcome = async {
     loop {
         tokio::select! {
+            _ = share_report.tick() => {
+                info!(submitted, accepted, rejected, stale, "プールシェア統計");
+            }
             candidate = candidate_rx.recv() => {
                 let Some((candidate_generation, share)) = candidate else {
                     // The proof worker owns this sender. Its failure must not be mistaken
@@ -396,21 +434,29 @@ async fn run_gpu_worker(cli: Cli, config: FileConfig, stateaa: StateaaConfig) ->
                     bridge.abort();
                     cancel.store(true, Ordering::Release);
                     actor.abort();
-                    return gpu_task.await.context("joining CUDA worker after share channel closed")?;
+                    return (&mut gpu_task).await.context("joining CUDA worker after share channel closed")?;
                 };
                 if candidate_generation != generation.load(Ordering::Acquire)
                     || cancel.load(Ordering::Acquire)
                 {
+                    stale += 1;
                     warn!(job_id = %share.job_id, "期限切れのGPU候補を送信前に破棄しました");
                     continue;
                 }
                 info!(job_id = %share.job_id, "CPU検証済みシェアをプールへ送信しています");
-                match pool.submit_verified(share.clone()).await {
-                    Ok(SubmitResult::Accepted) => info!(job_id = %share.job_id, "Kryptexがシェアを受理しました"),
+                submitted += 1;
+                match tokio::time::timeout(std::time::Duration::from_secs(30), pool.submit_verified(share.clone()))
+                    .await.context("pool share acknowledgement timed out after 30 seconds")? {
+                    Ok(SubmitResult::Accepted) => {
+                        accepted += 1;
+                        info!(job_id = %share.job_id, accepted, "Kryptexがシェアを受理しました");
+                    },
                     Ok(SubmitResult::Rejected { kind, reason }) => {
+                        rejected += 1;
                         warn!(job_id = %share.job_id, ?kind, %reason, "Kryptexがシェアを拒否しました")
                     }
                     Err(error) if error.to_string().contains("stale") => {
+                        stale += 1;
                         warn!(job_id = %share.job_id, "送信前にシェアの有効期限が切れました")
                     }
                     Err(error) => return Err(error),
@@ -432,6 +478,15 @@ async fn run_gpu_worker(cli: Cli, config: FileConfig, stateaa: StateaaConfig) ->
             }
         }
     }
+    }.await;
+    bridge.abort();
+    cancel.store(true, Ordering::Release);
+    actor.abort();
+    drop(candidate_rx);
+    if !gpu_task.is_finished() {
+        let _ = gpu_task.await;
+    }
+    outcome
 }
 
 fn gpu_loop(
@@ -493,12 +548,19 @@ fn gpu_loop(
             result
         });
         let mining_result = (|| -> Result<()> {
+            let mut report_started = Instant::now();
+            let mut report_work = 0.0;
+            let mut report_scan = 0.0;
+            let mut total_tiles = 0u64;
+            let mut total_candidates = 0u64;
+            let mut total_attempts = 0u64;
             while let Ok(mut tagged_job) = job_rx.recv() {
                 while let Ok(newest) = job_rx.try_recv() {
                     tagged_job = newest;
                 }
                 let (this_generation, job) = tagged_job;
                 cancel.store(false, Ordering::Release);
+                info!(job_id = %job.job_id, target = %format!("{:064x}", job.target), "新しい採掘ジョブを受信しました");
                 let mut attempt = 0u64;
                 let prep_generation = generation.clone();
                 let prep_cancel = cancel.clone();
@@ -536,17 +598,18 @@ fn gpu_loop(
                         .context("matrix attempt counter exhausted")?;
                     prefetch.request(next_attempt)?;
                     let gpu_preparation = Instant::now();
-                    info!("GPUにジョブを準備しています | ジョブ={}", job.job_id);
+                    debug!("GPUにジョブを準備しています | ジョブ={}", job.job_id);
                     kernel
                         .prepare_job(&problem)
                         .context("GPUジョブの準備に失敗しました")?;
                     if generation.load(Ordering::Acquire) != this_generation {
                         break;
                     }
-                    info!("ジョブ準備完了 | ジョブ={} | CPU準備={:.3}秒 | CPU待機={:.3}秒 | GPU準備={:.3}秒 | バッチ={}",
+                    let gpu_seconds = gpu_preparation.elapsed().as_secs_f64();
+                    debug!("ジョブ準備完了 | ジョブ={} | CPU準備={:.3}秒 | CPU待機={:.3}秒 | GPU準備={:.3}秒 | バッチ={}",
                         job.job_id, cpu_seconds, cpu_wait, gpu_preparation.elapsed().as_secs_f64(),
                         kernel.mining_groups(&problem)?.map_or(kernel.batch_size(), |(_, groups)| groups as usize * 128));
-                    job::scan_job(
+                    let stats = job::scan_job(
                         &problem,
                         &job,
                         &*kernel,
@@ -568,6 +631,21 @@ fn gpu_loop(
                                 .context("queueing GPU candidate for CPU proof")
                         },
                     )?;
+                    report_work += stats.macs;
+                    report_scan += stats.scan_seconds;
+                    total_tiles += stats.tiles;
+                    total_candidates += stats.candidates;
+                    total_attempts += 1;
+                    if report_started.elapsed().as_secs() >= 10 {
+                        info!("採掘状況 | ジョブ={} | 平均={} | スキャン速度={} | 累計タイル={} | 累計GPU候補={} | 累計試行={} | CPU待機={:.3}秒 | GPU準備={:.3}秒",
+                            job.job_id, job::format_hashrate(report_work / report_started.elapsed().as_secs_f64()),
+                            job::format_hashrate(report_work / report_scan.max(f64::MIN_POSITIVE)),
+                            total_tiles, total_candidates, total_attempts, cpu_wait,
+                            gpu_seconds);
+                        report_work = 0.0;
+                        report_scan = 0.0;
+                        report_started = Instant::now();
+                    }
                     attempt = next_attempt;
                 }
             }

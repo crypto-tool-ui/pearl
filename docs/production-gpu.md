@@ -107,3 +107,19 @@ Hardware acceptance, sustained hashrate and live-pool acceptance must be measure
 on each target. Compilation and CPU emulation do not establish any of those.
 Use compute-sanitizer memcheck/racecheck/synccheck on the acceptance test binary
 where available before a long mining run.
+
+## Operational acceptance
+
+- Run `pearl-miner --selftest --device 0` on the actual target. This now includes
+  GPU candidate -> official verified proof -> V2 encoding, in addition to tile tests.
+- Every production batch reports a device-written completed-tile count, checked
+  against the requested range. A mismatch is fatal, never counted as hashrate.
+- Default INFO output aggregates mining work over ten-second windows across attempts;
+  share-response counters are logged every thirty seconds. Per-attempt details are DEBUG.
+- A real pool accepted response is still required for live acceptance. Synthetic
+  self-tests do not establish pool acceptance or sustained production stability.
+- Run a sustained session and inspect accepted/rejected/stale totals, proof errors,
+  temperatures, clocks and restarts. A few seconds with zero hits is inconclusive:
+  at 262 TH/s and the observed target, expected spacing is about 34 seconds.
+- Submission acknowledgement times out at 30 seconds. Failure closes the worker,
+  cancels background work and propagates nonzero exit status to the supervisor.

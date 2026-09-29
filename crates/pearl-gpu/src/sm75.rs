@@ -466,7 +466,7 @@ impl ProductionCudaKernel {
     }
 
     pub(crate) fn from_context(context: Arc<CudaContext>) -> Result<Self> {
-        let (cubin, architecture, band) = match context.compute_capability()? {
+        let (cubin, architecture, default_band) = match context.compute_capability()? {
             (7, 5) => (
                 embedded_cubin!("PEARL_PRODUCTION_SM75"),
                 KernelArchitecture::Sm75Mma,
@@ -485,16 +485,27 @@ impl ProductionCudaKernel {
             cc => bail!("unsupported production capability {cc:?}"),
         };
         let cubin = cubin.context("production cubin unavailable; rebuild with CUDA nvcc")?;
+        let setting = |name: &str, default: u32, max: u32| -> Result<u32> {
+            let value = match std::env::var(name) {
+                Ok(value) => value.parse::<u32>().with_context(|| format!("invalid {name}"))?,
+                Err(std::env::VarError::NotPresent) => default,
+                Err(error) => return Err(error.into()),
+            };
+            ensure!((1..=max).contains(&value), "{name} must be in 1..={max}");
+            Ok(value)
+        };
+        let band = setting("PEARL_SCAN_BAND", default_band, 32)?;
+        let waves = setting("PEARL_SCAN_WAVES", 16, 64)?;
         let groups_per_launch = u32::try_from(
             context.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         )?
-        .saturating_mul(16)
-        .clamp(32, 4096);
+        .saturating_mul(waves)
+        .clamp(32, 16384);
         let scan = load_cuda_kernel(&context, cubin, "pearl_production_scan")?;
         let stream = context.default_stream();
         let scratch = RefCell::new(ScanScratch {
             bound: stream.alloc_zeros::<u32>(8)?,
-            count: stream.alloc_zeros::<u32>(1)?,
+            count: stream.alloc_zeros::<u32>(2)?,
             hits: stream.alloc_zeros::<u32>(HIT_CAPACITY as usize * HIT_WORDS)?,
         });
         Ok(Self {
@@ -567,7 +578,10 @@ impl ProductionCudaKernel {
                 )
             }?;
         }
-        let count = stream.clone_dtoh(&scratch.count)?[0];
+        let counters = stream.clone_dtoh(&scratch.count)?;
+        ensure!(counters[1] == groups * 128,
+            "GPU completed {} tiles, expected {}; refusing to report unconfirmed work", counters[1], groups * 128);
+        let count = counters[0];
         if count > HIT_CAPACITY {
             return Ok(None);
         }

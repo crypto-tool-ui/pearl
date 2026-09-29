@@ -6,7 +6,7 @@ use pearl_net::PoolJob;
 use pearl_ref::{share_bound, IncompleteBlockHeader, Problem, TileResult};
 use primitive_types::U256;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Builds the committed V3 work unit from the exact 76-byte header sent by Kryptex.
 pub fn problem_for_job_mode(job: &PoolJob, attempt: u64, deferred: bool) -> Result<Problem> {
@@ -21,6 +21,20 @@ pub fn problem_for_job_mode(job: &PoolJob, attempt: u64, deferred: bool) -> Resu
     else { Problem::from_kryptex_header_attempt(header, attempt) }
 }
 
+#[derive(Default, Debug)]
+pub struct ScanStats {
+    pub tiles: u64,
+    pub candidates: u64,
+    pub macs: f64,
+    pub scan_seconds: f64,
+}
+impl ScanStats {
+    fn new(tiles: usize, candidates: usize, tile_work: f64, scan_seconds: f64) -> Self {
+        Self { tiles: tiles as u64, candidates: candidates as u64,
+            macs: tiles as f64 * tile_work, scan_seconds }
+    }
+}
+
 /// Scans the fixed Kryptex tile partition with the selected production kernel.
 ///
 /// GPU target hits go to a bounded CPU proof worker; scanning continues after every hit.
@@ -32,7 +46,7 @@ pub fn scan_job(
     should_cancel: impl Fn() -> bool,
     started: Instant,
     mut on_candidate: impl FnMut(TileResult, u64) -> Result<()>,
-) -> Result<()> {
+) -> Result<ScanStats> {
     ensure!(
         !job.requires_update(),
         "update required: unsupported certificate version"
@@ -48,16 +62,18 @@ pub fn scan_job(
         })?;
     let (row_offsets, col_offsets) = problem.tile_offsets();
     let total = row_offsets.len().saturating_mul(col_offsets.len());
+    let tile_work = problem.config.rows_pattern.size() as f64
+        * problem.config.cols_pattern.size() as f64 * problem.k() as f64;
     let mut scanned = 0usize;
     let mut candidates = 0usize;
     let mean_tiles_per_share = expected_tiles_per_share(bound);
     let grouped = kernel.mining_groups(problem)?;
     let batch_tiles = grouped.map_or(kernel.batch_size(), |(_, groups)| groups as usize * 128);
-    info!(
+    debug!(
         "マイニング開始 | ジョブ={} | 総タイル数={} | バッチ={}",
         job.job_id, total, batch_tiles
     );
-    info!("シェア難易度 | ジョブ={} | プール目標={:064x} | GPU目標={:064x} | 平均必要タイル={:.0}",
+    debug!("シェア難易度 | ジョブ={} | プール目標={:064x} | GPU目標={:064x} | 平均必要タイル={:.0}",
         job.job_id, job.target, bound, mean_tiles_per_share);
     let mut group_cursor = 0;
     let mut bound_bytes = [0; 32];
@@ -72,7 +88,7 @@ pub fn scan_job(
     loop {
         if should_cancel() {
             warn!(job_id = %job.job_id, scanned, "新しいジョブを受信したため、古いジョブを中止しました");
-            return Ok(());
+            return Ok(ScanStats::new(scanned, candidates, tile_work, scan_started.elapsed().as_secs_f64()));
         }
         let (tiles, completed, per_tile) = if let Some((groups, batch)) = grouped {
             if group_cursor == groups {
@@ -103,7 +119,7 @@ pub fn scan_job(
             (tiles, requests.len(), work)
         };
         if should_cancel() {
-            return Ok(());
+            return Ok(ScanStats::new(scanned, candidates, tile_work, scan_started.elapsed().as_secs_f64()));
         }
         scanned += completed;
         candidates += tiles.iter().filter(|tile| U256::from_little_endian(&tile.digest) <= bound).count();
@@ -113,7 +129,7 @@ pub fn scan_job(
         if last_report.elapsed().as_secs() >= 10 {
             let current_tiles =
                 (scanned - last_scanned) as f64 / last_report.elapsed().as_secs_f64();
-            info!("採掘状況 | ジョブ={} | ハッシュレート={} | 平均={} | タイル/秒={:.2} | 処理済み={} | バッチ={} | GPU候補={} | 平均シェア間隔秒={:.0}",
+            debug!("採掘状況 | ジョブ={} | ハッシュレート={} | 平均={} | タイル/秒={:.2} | 処理済み={} | バッチ={} | GPU候補={} | 平均シェア間隔秒={:.0}",
                 job.job_id, format_hashrate(current_tiles * per_tile), format_hashrate(hashrate as f64),
                 current_tiles, scanned, completed, candidates, mean_tiles_per_share * elapsed / scanned as f64);
             last_scanned = scanned;
@@ -121,7 +137,7 @@ pub fn scan_job(
         }
         for tile in tiles {
             if should_cancel() {
-                return Ok(());
+                return Ok(ScanStats::new(scanned, candidates, tile_work, scan_started.elapsed().as_secs_f64()));
             }
             if U256::from_little_endian(&tile.digest) > bound {
                 continue;
@@ -134,11 +150,11 @@ pub fn scan_job(
     let elapsed = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
     let tile_work = problem.config.rows_pattern.size() as f64
         * problem.config.cols_pattern.size() as f64 * problem.k() as f64;
-    info!("全タイルの処理が完了しました | ジョブ={} | 処理済み={} | GPU候補={} | 平均={} | スキャン速度={} | 平均シェア間隔秒={:.0}",
+    debug!("全タイルの処理が完了しました | ジョブ={} | 処理済み={} | GPU候補={} | 平均={} | スキャン速度={} | 平均シェア間隔秒={:.0}",
         job.job_id, scanned, candidates, format_hashrate(scanned as f64 * tile_work / elapsed),
         format_hashrate(scanned as f64 * tile_work / scan_started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)),
         mean_tiles_per_share * elapsed / (scanned as f64).max(1.0));
-    Ok(())
+    Ok(ScanStats::new(scanned, candidates, tile_work, scan_started.elapsed().as_secs_f64()))
 }
 
 // Uniform 256-bit jackpot, inclusive bound. Use the actual adjusted pool target,
@@ -152,7 +168,7 @@ fn expected_tiles_per_share(bound: U256) -> f64 {
 
 // Keep the pool's existing logical h*w*k rate convention; do not count an MMA
 // multiply and add twice or confuse tile hashes/s with this work-normalized rate.
-fn format_hashrate(rate: f64) -> String {
+pub fn format_hashrate(rate: f64) -> String {
     for (scale, unit) in [(1e12, "TH/s"), (1e9, "GH/s"), (1e6, "MH/s"), (1e3, "kH/s")] {
         if rate >= scale {
             return format!("{:.3} {unit}", rate / scale);
@@ -228,7 +244,7 @@ mod tests {
             calls: RefCell::new(Vec::new()),
         };
         let mut hits = Vec::new();
-        scan_job(
+        let stats = scan_job(
             &p,
             &job,
             &kernel,
@@ -240,6 +256,9 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(stats.tiles, 384);
+        assert_eq!(stats.candidates, 3);
+        assert!(stats.macs > 0.0 && stats.scan_seconds > 0.0);
         assert_eq!(*kernel.calls.borrow(), [(0, 2), (2, 1)]);
         assert_eq!(hits, [0, 128, 256]);
     }
@@ -252,7 +271,7 @@ mod tests {
         };
         let cancelled = Cell::new(false);
         let hits = Cell::new(0);
-        scan_job(
+        let stats = scan_job(
             &p,
             &job,
             &kernel,
@@ -265,6 +284,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(stats.tiles, 256);
         assert_eq!(hits.get(), 1);
         assert_eq!(*kernel.calls.borrow(), [(0, 2)]);
     }

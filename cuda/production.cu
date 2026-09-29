@@ -161,6 +161,7 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
       stages[0][(threadIdx.x - 64) * 16 + i] = transcript[i];
   }
   __syncthreads();
+  if (threadIdx.x == 0) atomicAdd(count + 1, 128u); // device-confirmed completed proof tiles
   if (warp & 2) return;
 #pragma unroll
   for (unsigned i = 0; i < 16; ++i)

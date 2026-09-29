@@ -97,15 +97,16 @@ int main() {
     for(auto &x:b) x=int(rng()%255)-127;
     uint8_t seed[32]; for(auto &x:seed) x=rng();
     uint32_t bound[8]; std::fill(bound,bound+8,0xffffffffu);
-    std::vector<uint32_t> hits(128*26+16,0xdeadbeefu); unsigned count=0;
+    std::vector<uint32_t> hits(128*26+16,0xdeadbeefu); unsigned counters[2]={}; unsigned &count=counters[0];
     auto run=[&](unsigned capacity) {
-      count=0; blockIdx.x=0;
+      count=0; counters[1]=0; blockIdx.x=0;
       std::vector<std::thread> threads;
       for(unsigned t=0;t<EMU_THREADS;++t) threads.emplace_back([&,t] {
         threadIdx.x=t;
         pearl_production_scan(a.data(),b.data(),m,n,k,rank,begin,band,seed,bound,capacity,&count,hits.data());
       });
       for(auto &t:threads)t.join();
+      if(counters[1]!=128) throw std::runtime_error("device work counter mismatch");
     };
     run(128);
     if(count!=128) throw std::runtime_error("missing hits");

@@ -8,10 +8,11 @@ mkdir -p dist
 install -m755 target/release/pearl-miner dist/pearl-miner
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-mkdir -p "$stage/$name/systemd" "$stage/$name/docs"
+mkdir -p "$stage/$name/systemd" "$stage/$name/docs" "$stage/$name/tools"
 install -m755 target/release/pearl-miner "$stage/$name/pearl-miner"
 cp README.md config.example.toml tunel.py requirements-tunnel.txt "$stage/$name/"
 cp systemd/pearl-miner.service "$stage/$name/systemd/"
-cp docs/production-gpu.md "$stage/$name/docs/"
+cp docs/production-gpu.md docs/profiling.md "$stage/$name/docs/"
+cp tools/profile_production.py "$stage/$name/tools/"
 tar -C "$stage" -czf "dist/$name.tar.gz" "$name"
 (cd dist && sha256sum pearl-miner "$name.tar.gz" > "$name.sha256")

@@ -199,18 +199,25 @@ potential bottleneck. See [implementation and validation
 notes](docs/production-gpu.md) for references, constraints and test coverage.
 
 Console hashrates use logical `h × w × k` MAC/s: 1 TH/s = 10¹² MAC/s. Current
-scan rate excludes preparation; the per-attempt average and submitted rate
-include that attempt's preparation and scan time. Benchmarks print setup time
+scan rate excludes preparation. The INFO heartbeat aggregates confirmed work across
+attempts over at least ten seconds, including preparation and waiting. Submitted
+rates include that attempt's preparation and scan time. Benchmarks print setup time
 separately. These rates are neither BLAKE3 hashes/s nor Tensor Core TOPS.
 `STATEAA` log=0 still disables mining console output.
 
 ## Diagnosing missing shares
 
-The miner prints the pool target and adjusted GPU target at scan start, GPU
-candidate counts, and an estimated mean share interval based on the actual target
-and measured rate. This is a statistical mean, not a deadline. Short attempts also
-print their rate when the scan finishes. Candidate detection, CPU proof start/end,
-stale-candidate drops, submission and pool acceptance/rejection have separate logs.
+INFO logging prints a mining heartbeat every ten seconds (at the next attempt
+boundary) and submitted/accepted/rejected/stale totals every thirty seconds.
+Preparation and per-attempt completion messages are DEBUG only; use
+`RUST_LOG=info` for normal operation. A GPU completion counter must confirm every
+batch before it contributes to hashrate. Startup additionally constructs and
+verifies an official proof from an actual GPU candidate and encodes it as V2,
+using a local synthetic target that is never submitted to the pool.
+Candidate detection, CPU proof start/end, submission and pool responses remain
+immediate logs. Pool acknowledgement timeout is thirty seconds; errors stop the
+worker and propagate a failure exit status so systemd can restart it. The metrics
+endpoint does not export a fabricated zero accepted-share counter.
 
 At difficulty 2097152 and rank 128, approximate mean intervals are 12.5 hours at
 200 GH/s, 10.7 minutes at 14 TH/s, and 7.5 minutes at 20 TH/s. These assume steady
