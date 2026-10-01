@@ -57,8 +57,9 @@ __device__ __forceinline__ void stage_ready(uint32_t* out, const uint4 (&prefetc
 }
 
 #define PRODUCTION_THREADS 256
-#define PRODUCTION_BLOCKS 2
-extern "C" __global__ __launch_bounds__(PRODUCTION_THREADS, PRODUCTION_BLOCKS)
+// Do not force two CTAs/SM: ptxas spills the final transcript register under
+// that cap on SM90/SM120. Let each target choose its register count/occupancy.
+extern "C" __global__ __launch_bounds__(PRODUCTION_THREADS)
 void pearl_production_scan(const int8_t* a, const int8_t* bt,
     unsigned m, unsigned n, unsigned k, unsigned rank,
     unsigned begin, unsigned band, const uint8_t* seed, const uint32_t* bound,
