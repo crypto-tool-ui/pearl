@@ -62,9 +62,14 @@ __device__ __forceinline__ void stage_ready(uint32_t* out, const uint4 (&prefetc
 extern "C" __global__ __launch_bounds__(PRODUCTION_THREADS)
 void pearl_production_scan(const int8_t* a, const int8_t* bt,
     unsigned m, unsigned n, unsigned k, unsigned rank,
-    unsigned begin, unsigned band, const uint8_t* seed, const uint32_t* bound,
-    unsigned capacity, uint32_t* count, uint32_t* hits) {
+    const unsigned* begin_ptr, const unsigned* groups_ptr, unsigned band,
+    const uint8_t* seed, const uint32_t* bound,
+    unsigned capacity, uint32_t* count, uint32_t* hits,
+    int32_t* c_snapshots) {
   __shared__ __align__(16) uint32_t stages[2][WORDS];
+  const unsigned begin = *begin_ptr;
+  const unsigned groups = *groups_ptr;
+  if (blockIdx.x >= groups) return;
   // Host admits complete 128x128 CTAs and K/rank multiples of 64 only.
   const unsigned index = begin + blockIdx.x;
   const unsigned grid_m = m / BM, grid_n = n / BN;
@@ -133,6 +138,28 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
     // of doing a runtime integer remainder in every K step on every thread.
     if (kk + BK == next_fold) {
       next_fold += rank;
+#if __CUDA_ARCH__ >= 800
+      // A/B mode: persist this cumulative INT32 C snapshot. Fused mode passes nullptr.
+      // Layout is [group-in-batch][rank-boundary][row][column].
+      if (c_snapshots) {
+        const unsigned boundary = (kk + BK) / rank - 1;
+        int32_t* out = c_snapshots +
+            (size_t(blockIdx.x) * (k / rank) + boundary) * BM * BN;
+#pragma unroll
+        for (unsigned i = 0; i < 2; ++i) {
+          const unsigned row0 = wr + i * 16 + group;
+          const unsigned row1 = row0 + 8;
+#pragma unroll
+          for (unsigned j = 0; j < 8; ++j) {
+            const unsigned col = wc + j * 8 + pair * 2;
+            out[row0 * BN + col] = acc[2 * i][j][0];
+            out[row0 * BN + col + 1] = acc[2 * i][j][1];
+            out[row1 * BN + col] = acc[2 * i + 1][j][0];
+            out[row1 * BN + col + 1] = acc[2 * i + 1][j][1];
+          }
+        }
+      }
+#endif
       uint32_t fold[8] = {};
 #pragma unroll
       for (unsigned j = 0; j < 8; ++j)
@@ -168,6 +195,10 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
       stages[0][(threadIdx.x - 64) * 16 + i] = transcript[i];
   }
   __syncthreads();
+#if __CUDA_ARCH__ >= 800
+  // The buffered path launches a distinct transcript/hash pass over C snapshots.
+  if (c_snapshots) return;
+#endif
   if (threadIdx.x == 0) atomicAdd(count + 1, 128u); // device-confirmed completed proof tiles
   if (warp & 2) return;
 #pragma unroll
@@ -191,6 +222,74 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
       for (unsigned i = 0; i < 16; ++i) dst[2+i] = transcript[i];
 #pragma unroll
       for (unsigned i = 0; i < 8; ++i) dst[18+i] = load_u32_le(digest + i*4);
+    }
+  }
+}
+
+// Buffered A/B path: C snapshots are read in rank order and hashed separately.
+extern "C" __global__ void pearl_production_hash_buffered(
+    const int32_t* c_snapshots, unsigned k, unsigned rank, unsigned groups,
+    unsigned m, unsigned n, unsigned begin, unsigned band, const uint8_t* seed,
+    const uint32_t* bound, unsigned capacity, uint32_t* count, uint32_t* hits) {
+  const unsigned group = blockIdx.x;
+  const unsigned candidate = threadIdx.x;
+  if (group >= groups || candidate >= 128) return;
+  const unsigned grid_m = m / BM, grid_n = n / BN;
+  const unsigned index = begin + group;
+  const unsigned first_row = (index / (band * grid_n)) * band;
+  const unsigned band_rows = min(band, grid_m - first_row);
+  const unsigned local = index - (index / (band * grid_n)) * band * grid_n;
+  const unsigned row_tile = (first_row + local % band_rows) * BM;
+  const unsigned col_tile = (local / band_rows) * BN;
+  const unsigned source_thread = candidate < 64 ? candidate : candidate + 64;
+  const unsigned warp = source_thread >> 5;
+  const unsigned lane = source_thread & 31;
+  const unsigned row = (warp / 2) * 32 + lane / 4;
+  const unsigned col = (warp % 2) * 64 + (lane % 4) * 2;
+  const unsigned rank_count = k / rank;
+  uint32_t transcript[16] = {};
+  for (unsigned r = 0; r < rank_count; ++r) {
+    const int32_t* matrix = c_snapshots +
+        (size_t(group) * rank_count + r) * BM * BN;
+    uint32_t folded = 0;
+#pragma unroll
+    for (unsigned rr = 0; rr < 8; ++rr)
+#pragma unroll
+      for (unsigned cc = 0; cc < 8; ++cc) {
+        const unsigned c = col + cc * 8;
+        folded ^= static_cast<uint32_t>(matrix[(row + rr * 8) * BN + c]);
+        folded ^= static_cast<uint32_t>(matrix[(row + rr * 8) * BN + c + 1]);
+      }
+    const uint32_t head = (transcript[0] << 13 | transcript[0] >> 19) ^ folded;
+#pragma unroll
+    for (unsigned i = 0; i < 15; ++i) transcript[i] = transcript[i + 1];
+    transcript[15] = head;
+  }
+  for (unsigned r = rank_count & 15; r != 0; --r) {
+    const uint32_t last = transcript[15];
+#pragma unroll
+    for (int i = 15; i > 0; --i) transcript[i] = transcript[i - 1];
+    transcript[0] = last;
+  }
+  uint8_t digest[32];
+  blake3_jackpot_hash(transcript, seed, digest);
+  bool wins = true;
+#pragma unroll
+  for (int i = 7; i >= 0; --i) {
+    const uint32_t word = load_u32_le(digest + i * 4);
+    if (word != bound[i]) { wins = word < bound[i]; break; }
+  }
+  if (candidate == 0) atomicAdd(count + 1, 128u);
+  if (wins) {
+    const unsigned slot = atomicAdd(count, 1u);
+    if (slot < capacity) {
+      uint32_t* dst = hits + size_t(slot) * RECORD_WORDS;
+      dst[0] = row_tile + row;
+      dst[1] = col_tile + col;
+#pragma unroll
+      for (unsigned i = 0; i < 16; ++i) dst[2 + i] = transcript[i];
+#pragma unroll
+      for (unsigned i = 0; i < 8; ++i) dst[18 + i] = load_u32_le(digest + i * 4);
     }
   }
 }

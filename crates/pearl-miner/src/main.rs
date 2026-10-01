@@ -119,6 +119,42 @@ struct Cli {
     power_limit_watts: Option<u32>,
     graphics_clock_mhz: Option<u32>,
     memory_clock_mhz: Option<u32>,
+    mem_mode: MemMode,
+    vram_budget_gb: f64,
+    streams: usize,
+    groups_per_launch: Option<u32>,
+    gpu_benchmark_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MemMode {
+    #[default]
+    Fused,
+    Buffered,
+    Pipelined,
+}
+
+impl std::str::FromStr for MemMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "fused" => Ok(Self::Fused),
+            "buffered" => Ok(Self::Buffered),
+            "pipelined" => Ok(Self::Pipelined),
+            _ => bail!("--mem-mode must be fused, buffered, or pipelined"),
+        }
+    }
+}
+
+impl MemMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fused => "fused",
+            Self::Buffered => "buffered",
+            Self::Pipelined => "pipelined",
+        }
+    }
 }
 
 fn default_device() -> usize {
@@ -126,12 +162,15 @@ fn default_device() -> usize {
 }
 
 fn usage() -> &'static str {
-    "pearl-miner [OPTIONS]\n\n  STATEAA=hex(endpoint|wallet|worker|log[|password])\n  log: 1 = console on, 0 = console off; password defaults to x\n\n  --config PATH             Read optional device/metrics config\n  --benchmark               Run the offline CPU benchmark\n  --gpu-benchmark           Self-test and benchmark resident production GPU mining\n  --selftest                Verify golden tiles and batches on the selected GPU\n  --gpu-worker              Internal disposable GPU child process\n  --device N                Override the CUDA device ordinal\n  --metrics-listen ADDR     Expose Prometheus text metrics\n  --power-limit-watts N     Apply nvidia-smi power limit\n  --graphics-clock-mhz N    Apply locked graphics clock\n  --memory-clock-mhz N      Apply locked memory clock\n  -h, --help                Show this help"
+    "pearl-miner [OPTIONS]\n\n  STATEAA=hex(endpoint|wallet|worker|log[|password])\n  log: 1 = console on, 0 = console off; password defaults to x\n\n  --config PATH             Read optional device/metrics config\n  --benchmark               Run the offline CPU benchmark\n  --gpu-benchmark           Self-test and benchmark resident production GPU mining\n  --gpu-benchmark-seconds N Set GPU benchmark duration (default 30)\n  --selftest                Verify golden tiles and batches on the selected GPU\n  --gpu-worker              Internal disposable GPU child process\n  --device N                Override the CUDA device ordinal\n  --mem-mode MODE           Scan mode: fused (default), buffered, pipelined\n  --vram-budget-gb N        VRAM target for buffered mode (default 12.46)\n  --streams N               Pipeline depth (2..8, default 3)\n  --groups-per-launch N     Override groups per launch\n  --metrics-listen ADDR     Expose Prometheus text metrics\n  --power-limit-watts N     Apply nvidia-smi power limit\n  --graphics-clock-mhz N    Apply locked graphics clock\n  --memory-clock-mhz N     Apply locked memory clock\n  -h, --help                Show this help"
 }
 
 fn parse_cli() -> Result<Cli> {
     let mut cli = Cli {
         config: PathBuf::from("config.toml"),
+        vram_budget_gb: 12.46,
+        streams: 3,
+        gpu_benchmark_seconds: 30,
         ..Cli::default()
     };
     let mut args = env::args().skip(1);
@@ -145,6 +184,11 @@ fn parse_cli() -> Result<Cli> {
             "--gpu-benchmark" => cli.gpu_benchmark = true,
             "--selftest" => cli.selftest = true,
             "--gpu-worker" => cli.gpu_worker = true,
+            "--mem-mode" => cli.mem_mode = value("--mem-mode", &mut args)?.parse()?,
+            "--vram-budget-gb" => cli.vram_budget_gb = value("--vram-budget-gb", &mut args)?.parse().context("invalid --vram-budget-gb")?,
+            "--streams" => cli.streams = value("--streams", &mut args)?.parse().context("invalid --streams")?,
+            "--groups-per-launch" => cli.groups_per_launch = Some(value("--groups-per-launch", &mut args)?.parse().context("invalid --groups-per-launch")?),
+            "--gpu-benchmark-seconds" => cli.gpu_benchmark_seconds = value("--gpu-benchmark-seconds", &mut args)?.parse().context("invalid --gpu-benchmark-seconds")?,
             "--device" => cli.device = Some(value("--device", &mut args)?.parse().context("invalid --device")?),
             "--metrics-listen" => cli.metrics_listen = Some(value("--metrics-listen", &mut args)?),
             "--power-limit-watts" => cli.power_limit_watts = Some(value("--power-limit-watts", &mut args)?.parse().context("invalid power limit")?),
@@ -157,6 +201,10 @@ fn parse_cli() -> Result<Cli> {
             other => bail!("unknown option {other}\n\n{}", usage()),
         }
     }
+    ensure!(cli.vram_budget_gb.is_finite() && cli.vram_budget_gb >= 1.0, "--vram-budget-gb must be finite and at least 1 GiB");
+    ensure!((2..=8).contains(&cli.streams), "--streams must be in 2..=8");
+    ensure!(cli.groups_per_launch.map_or(true, |n| n > 0), "--groups-per-launch must be positive");
+    ensure!((1..=3600).contains(&cli.gpu_benchmark_seconds), "--gpu-benchmark-seconds must be in 1..=3600");
     Ok(cli)
 }
 
@@ -251,7 +299,7 @@ fn run_benchmark() -> Result<()> {
     Ok(())
 }
 
-fn run_gpu_benchmark(device: usize) -> Result<()> {
+fn run_gpu_benchmark(device: usize, duration_seconds: u64) -> Result<()> {
     let kernel = select_production_kernel(device)?;
     selftest_kernel(&*kernel, device)?;
     info!(device, "本番サイズのGPUベンチマークを準備しています");
@@ -260,13 +308,19 @@ fn run_gpu_benchmark(device: usize) -> Result<()> {
     let problem = job::configured_problem(header, 0, kernel.device_matrix_preparation())?;
     kernel.prepare_job(&problem)?;
     let prep_seconds = preparation.elapsed().as_secs_f64();
+    if let Some((free, total)) = kernel.device_memory_info()? {
+        println!("PEARL_VRAM_JSON {}", serde_json::json!({
+            "free_bytes": free, "total_bytes": total,
+            "used_bytes": total.saturating_sub(free)
+        }));
+    }
     let (groups, batch) = kernel.mining_groups(&problem)?.context("grouped kernel unavailable")?;
     kernel.scan_groups(&problem, 0, batch.min(groups), [0; 32])?;
     let started = Instant::now();
     let mut cursor = 0;
     let mut scanned = 0u64;
     let mut launches = 0u64;
-    while started.elapsed().as_secs_f64() < 10.0 {
+    while started.elapsed().as_secs_f64() < duration_seconds as f64 {
         let count = batch.min(groups - cursor);
         ensure!(kernel.scan_groups(&problem, cursor, count, [0; 32])?.is_empty(),
             "zero-target benchmark returned a hit");
@@ -282,6 +336,7 @@ fn run_gpu_benchmark(device: usize) -> Result<()> {
         "architecture": format!("{:?}", kernel.metadata().architecture),
         "device": device, "m": problem.m, "n": problem.n, "k": problem.k(),
         "groups_per_launch": batch, "tiles": scanned, "launches": launches,
+        "mem_mode": env::var("PEARL_MEM_MODE").unwrap_or_else(|_| "fused".into()),
         "scan_seconds": seconds, "prep_seconds": prep_seconds,
         "th_s": scanned as f64 * 128.0 * problem.k() as f64 / seconds / 1e12,
         "includes": "kernel + launch + target upload + result readback",
@@ -347,6 +402,13 @@ async fn run_daemon(cli: Cli, config: FileConfig) -> Result<()> {
         .arg(&cli.config)
         .arg("--device")
         .arg(device.to_string());
+    child_command
+        .arg("--mem-mode").arg(cli.mem_mode.as_str())
+        .arg("--vram-budget-gb").arg(cli.vram_budget_gb.to_string())
+        .arg("--streams").arg(cli.streams.to_string());
+    if let Some(groups) = cli.groups_per_launch {
+        child_command.arg("--groups-per-launch").arg(groups.to_string());
+    }
     let mut child = child_command
         .spawn()
         .context("starting disposable GPU worker")?;
@@ -657,6 +719,12 @@ fn gpu_loop(
 
 async fn async_main() -> Result<()> {
     let cli = parse_cli()?;
+    env::set_var("PEARL_MEM_MODE", cli.mem_mode.as_str());
+    env::set_var("PEARL_VRAM_BUDGET_GB", cli.vram_budget_gb.to_string());
+    env::set_var("PEARL_STREAMS", cli.streams.to_string());
+    if let Some(groups) = cli.groups_per_launch {
+        env::set_var("PEARL_GROUPS_PER_LAUNCH", groups.to_string());
+    }
     let config = load_config(&cli.config)?;
     if cli.benchmark {
         init_tracing(true)?;
@@ -665,7 +733,7 @@ async fn async_main() -> Result<()> {
     let device = selected_device(&cli, &config);
     if cli.gpu_benchmark {
         init_tracing(true)?;
-        return run_gpu_benchmark(device);
+        return run_gpu_benchmark(device, cli.gpu_benchmark_seconds);
     }
     if cli.selftest {
         init_tracing(true)?;

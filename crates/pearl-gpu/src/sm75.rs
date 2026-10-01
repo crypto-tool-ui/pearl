@@ -4,9 +4,9 @@ use crate::{
     LoadedCudaKernel,
 };
 use anyhow::{bail, ensure, Context, Result};
-use cudarc::driver::{result, sys, CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
+use cudarc::driver::{result, sys, CudaContext, CudaEvent, CudaGraph, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PinnedHostSlice};
 use pearl_ref::{compute_jackpot_hash, MMAType, Problem, TileResult};
-use std::{cell::RefCell, ffi::c_void, sync::Arc};
+use std::{cell::{Cell, RefCell}, ffi::c_void, sync::Arc};
 const SM75_MMA_M: usize = 8;
 const SM75_MMA_N: usize = 8;
 const SM75_MMA_K: usize = 16;
@@ -448,13 +448,35 @@ pub struct ProductionCudaKernel {
     architecture: KernelArchitecture,
     groups_per_launch: u32,
     band: u32,
-    scratch: RefCell<ScanScratch>,
+    slots: Vec<PipelineSlot>,
+    mem_mode: ScanMemMode,
+    vram_budget_bytes: usize,
+    buffered_c: RefCell<Option<CudaSlice<i32>>>,
+    buffered_capacity_groups: Cell<u32>,
+    buffered_hash: Option<LoadedCudaKernel>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanMemMode { Fused, Buffered, Pipelined }
 
 struct ScanScratch {
     bound: CudaSlice<u32>,
     count: CudaSlice<u32>,
     hits: CudaSlice<u32>,
+    begin: CudaSlice<u32>,
+    groups: CudaSlice<u32>,
+}
+
+struct PipelineSlot {
+    stream: Arc<CudaStream>,
+    scratch: RefCell<ScanScratch>,
+    done: CudaEvent,
+    target_host: Option<RefCell<PinnedHostSlice<u32>>>,
+    begin_host: Option<RefCell<PinnedHostSlice<u32>>>,
+    groups_host: Option<RefCell<PinnedHostSlice<u32>>>,
+    count_host: Option<RefCell<PinnedHostSlice<u32>>>,
+    hits_host: Option<RefCell<PinnedHostSlice<u32>>>,
+    graph: RefCell<Option<CudaGraph>>,
 }
 
 const HIT_CAPACITY: u32 = 256;
@@ -485,6 +507,21 @@ impl ProductionCudaKernel {
             cc => bail!("unsupported production capability {cc:?}"),
         };
         let cubin = cubin.context("production cubin unavailable; rebuild with CUDA nvcc")?;
+        let mem_mode = match std::env::var("PEARL_MEM_MODE").as_deref() {
+            Ok("buffered") => ScanMemMode::Buffered,
+            Ok("pipelined") => ScanMemMode::Pipelined,
+            Ok("fused") | Err(_) => ScanMemMode::Fused,
+            Ok(other) => bail!("invalid PEARL_MEM_MODE {other}"),
+        };
+        ensure!(mem_mode != ScanMemMode::Buffered || architecture == KernelArchitecture::Sm120Mma,
+            "buffered mode currently requires an sm_120 device");
+        let vram_budget_bytes = std::env::var("PEARL_VRAM_BUDGET_GB")
+            .ok().map(|v| v.parse::<f64>()).transpose()
+            .context("invalid PEARL_VRAM_BUDGET_GB")?
+            .unwrap_or(12.46);
+        ensure!(vram_budget_bytes.is_finite() && vram_budget_bytes >= 1.0,
+            "PEARL_VRAM_BUDGET_GB must be finite and at least 1");
+        let vram_budget_bytes = (vram_budget_bytes * 1024.0 * 1024.0 * 1024.0) as usize;
         let setting = |name: &str, default: u32, max: u32| -> Result<u32> {
             let value = match std::env::var(name) {
                 Ok(value) => value.parse::<u32>().with_context(|| format!("invalid {name}"))?,
@@ -496,35 +533,84 @@ impl ProductionCudaKernel {
         };
         let band = setting("SCAN_BAND", default_band, 128)?;
         let waves = setting("SCAN_WAVES", 16, 128)?;
-        let groups_per_launch = u32::try_from(
+        let default_groups_per_launch = u32::try_from(
             context.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         )?
         .saturating_mul(waves)
         .clamp(32, 32768);
+        let groups_per_launch = match std::env::var("PEARL_GROUPS_PER_LAUNCH") {
+            Ok(value) => {
+                let groups = value.parse::<u32>().context("invalid PEARL_GROUPS_PER_LAUNCH")?;
+                ensure!(groups > 0, "PEARL_GROUPS_PER_LAUNCH must be positive");
+                groups
+            }
+            Err(std::env::VarError::NotPresent) => default_groups_per_launch,
+            Err(error) => return Err(error.into()),
+        };
         let scan = load_cuda_kernel(&context, cubin, "pearl_production_scan")?;
-        let stream = context.default_stream();
-        let scratch = RefCell::new(ScanScratch {
-            bound: stream.alloc_zeros::<u32>(8)?,
-            count: stream.alloc_zeros::<u32>(2)?,
-            hits: stream.alloc_zeros::<u32>(HIT_CAPACITY as usize * HIT_WORDS)?,
-        });
+        let buffered_hash = if mem_mode == ScanMemMode::Buffered {
+            Some(load_cuda_kernel(&context, cubin, "pearl_production_hash_buffered")?)
+        } else { None };
+        let stream_count = if mem_mode == ScanMemMode::Pipelined {
+            setting("PEARL_STREAMS", 3, 8)? as usize
+        } else { 1 };
+        ensure!(stream_count >= 2, "PEARL_STREAMS must be in 2..=8 for pipelined mode");
+        let streams = if mem_mode == ScanMemMode::Pipelined {
+            (0..stream_count).map(|_| context.new_stream()).collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            vec![context.default_stream()]
+        };
+        if mem_mode == ScanMemMode::Pipelined {
+            // Resident matrix preparation synchronizes the default stream before publishing the
+            // job. Disable cudarc's per-access event fences so the steady scan kernel is capturable.
+            unsafe { context.disable_event_tracking() };
+        }
+        let mut slots = Vec::with_capacity(stream_count);
+        for stream in streams {
+            let scratch = RefCell::new(ScanScratch {
+                bound: stream.alloc_zeros::<u32>(8)?,
+                count: stream.alloc_zeros::<u32>(2)?,
+                hits: stream.alloc_zeros::<u32>(HIT_CAPACITY as usize * HIT_WORDS)?,
+                begin: stream.alloc_zeros::<u32>(1)?,
+                groups: stream.alloc_zeros::<u32>(1)?,
+            });
+            let done = context.new_event(None)?;
+            let (target_host, begin_host, groups_host, count_host, hits_host) = if mem_mode == ScanMemMode::Pipelined {
+                let mut target = unsafe { context.alloc_pinned::<u32>(8)? };
+                let mut begin = unsafe { context.alloc_pinned::<u32>(1)? };
+                let mut groups = unsafe { context.alloc_pinned::<u32>(1)? };
+                let mut counters = unsafe { context.alloc_pinned::<u32>(2)? };
+                let mut hits = unsafe { context.alloc_pinned::<u32>(HIT_CAPACITY as usize * HIT_WORDS)? };
+                target.as_mut_slice()?.fill(0);
+                begin.as_mut_slice()?.fill(0);
+                groups.as_mut_slice()?.fill(0);
+                counters.as_mut_slice()?.fill(0);
+                hits.as_mut_slice()?.fill(0);
+                (Some(RefCell::new(target)), Some(RefCell::new(begin)), Some(RefCell::new(groups)),
+                    Some(RefCell::new(counters)), Some(RefCell::new(hits)))
+            } else { (None, None, None, None, None) };
+            slots.push(PipelineSlot { stream, scratch, done, target_host, begin_host, groups_host,
+                count_host, hits_host, graph: RefCell::new(None) });
+        }
         Ok(Self {
             base: MmaSm75CudaKernel::with_cubin(context, cubin)?,
             scan,
             architecture,
             groups_per_launch,
             band,
-            scratch,
+            slots,
+            mem_mode,
+            vram_budget_bytes,
+            buffered_c: RefCell::new(None),
+            buffered_capacity_groups: Cell::new(u32::MAX),
+            buffered_hash,
         })
     }
 
-    fn scan_once(
-        &self,
-        problem: &Problem,
-        begin: u32,
-        groups: u32,
-        bound: [u8; 32],
-    ) -> Result<Option<Vec<TileResult>>> {
+    fn scan_enqueue(&self, slot_index: usize, problem: &Problem, begin: u32,
+        groups: u32, bound: [u8; 32]) -> Result<()> {
+        ensure!(self.mem_mode != ScanMemMode::Buffered || slot_index == 0,
+            "buffered scan uses its single C snapshot ring");
         let resident = self.base.resident.borrow();
         let job = resident
             .as_ref()
@@ -534,22 +620,43 @@ impl ProductionCudaKernel {
                 && job.shape == (problem.m, problem.n, problem.k(), problem.config.rank),
             "resident job does not match scan problem"
         );
-        let stream = self.base.context.default_stream();
-        let mut scratch = self.scratch.borrow_mut();
+        let slot = &self.slots[slot_index];
+        let stream = &slot.stream;
+        let mut scratch = slot.scratch.borrow_mut();
+        let mut buffered = self.buffered_c.borrow_mut();
         let words: Vec<u32> = bound
             .chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
             .collect();
-        stream.memcpy_htod(&words, &mut scratch.bound)?;
-        stream.memset_zeros(&mut scratch.count)?;
+        let pipeline = self.mem_mode == ScanMemMode::Pipelined;
+        let capturing = pipeline && slot.graph.borrow().is_none();
+        if pipeline {
+            slot.target_host.as_ref().unwrap().borrow_mut().as_mut_slice()?.copy_from_slice(&words);
+            slot.begin_host.as_ref().unwrap().borrow_mut().as_mut_slice()?[0] = begin;
+            slot.groups_host.as_ref().unwrap().borrow_mut().as_mut_slice()?[0] = groups;
+            stream.memcpy_htod(&*slot.target_host.as_ref().unwrap().borrow(), &mut scratch.bound)?;
+            stream.memcpy_htod(&*slot.begin_host.as_ref().unwrap().borrow(), &mut scratch.begin)?;
+            stream.memcpy_htod(&*slot.groups_host.as_ref().unwrap().borrow(), &mut scratch.groups)?;
+            if capturing {
+                stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                stream.memset_zeros(&mut scratch.count)?;
+            }
+        } else {
+            stream.memcpy_htod(&words, &mut scratch.bound)?;
+            stream.memcpy_htod(&[begin], &mut scratch.begin)?;
+            stream.memcpy_htod(&[groups], &mut scratch.groups)?;
+            stream.memset_zeros(&mut scratch.count)?;
+        }
         {
             let (a, _a) = job.a.device_ptr(&stream);
             let (bt, _bt) = job.bt.device_ptr(&stream);
             let (seed, _seed) = job.seed.device_ptr(&stream);
-            let ScanScratch { bound, count, hits } = &mut *scratch;
+            let ScanScratch { bound, count, hits, begin: begin_buffer, groups: groups_buffer } = &mut *scratch;
             let (target, _target) = bound.device_ptr(&stream);
             let (count, _count) = count.device_ptr_mut(&stream);
             let (hits, _hits) = hits.device_ptr_mut(&stream);
+            let (begin_ptr, _begin_guard) = begin_buffer.device_ptr(&stream);
+            let (groups_ptr, _groups_guard) = groups_buffer.device_ptr(&stream);
             let k = u32::try_from(problem.k())?;
             let rank = u32::from(problem.config.rank);
             let mut args = [
@@ -559,26 +666,83 @@ impl ProductionCudaKernel {
                 param(&problem.n),
                 param(&k),
                 param(&rank),
-                param(&begin),
+                param(&begin_ptr),
+                param(&groups_ptr),
                 param(&self.band),
                 param(&seed),
                 param(&target),
                 param(&HIT_CAPACITY),
                 param(&count),
                 param(&hits),
+                std::ptr::null_mut(),
             ];
-            unsafe {
-                result::launch_kernel(
-                    self.scan.function,
-                    (groups, 1, 1),
-                    (256, 1, 1),
-                    0,
-                    stream.cu_stream(),
-                    &mut args,
-                )
-            }?;
+            if self.mem_mode == ScanMemMode::Buffered {
+                let buffer = buffered.as_mut().context("buffered scan was not allocated by prepare_job")?;
+                let (ptr, _buffer_guard) = buffer.device_ptr_mut(stream);
+                args[14] = param(&ptr);
+                unsafe { result::launch_kernel(self.scan.function, (groups, 1, 1), (256, 1, 1),
+                    0, stream.cu_stream(), &mut args) }?;
+            } else if !pipeline || capturing {
+                let null_buffer: sys::CUdeviceptr = 0;
+                args[14] = param(&null_buffer);
+                let grid = if pipeline {
+                    u32::try_from(self.groups_per_launch.div_ceil(self.slots.len() as u32))?
+                } else { groups };
+                unsafe { result::launch_kernel(self.scan.function, (grid, 1, 1), (256, 1, 1),
+                    0, stream.cu_stream(), &mut args) }?;
+            }
         }
-        let counters = stream.clone_dtoh(&scratch.count)?;
+        if self.mem_mode == ScanMemMode::Buffered {
+            let buffer = buffered.as_ref().context("buffered scan buffer missing")?;
+            let (c, _cg) = buffer.device_ptr(stream);
+            let (seed, _sg) = job.seed.device_ptr(stream);
+            let ScanScratch { bound, count, hits, .. } = &mut *scratch;
+            let (target, _tg) = bound.device_ptr(stream);
+            let (count_ptr, _count_guard) = count.device_ptr_mut(stream);
+            let (hits_ptr, _hits_guard) = hits.device_ptr_mut(stream);
+            let k = u32::try_from(problem.k())?;
+            let rank = u32::from(problem.config.rank);
+            let capacity = HIT_CAPACITY;
+            let mut args = [param(&c), param(&k), param(&rank), param(&groups),
+                param(&problem.m), param(&problem.n), param(&begin), param(&self.band),
+                param(&seed), param(&target), param(&capacity), param(&count_ptr), param(&hits_ptr)];
+            unsafe { result::launch_kernel(self.buffered_hash.as_ref().unwrap().function,
+                (groups, 1, 1), (128, 1, 1), 0, stream.cu_stream(), &mut args) }?;
+        }
+        if capturing {
+            let graph = stream.end_capture(sys::CUgraphInstantiate_flags(0))?
+                .context("CUDA pipeline capture produced no graph")?;
+            graph.upload()?;
+            *slot.graph.borrow_mut() = Some(graph);
+        }
+        if pipeline {
+            slot.graph.borrow().as_ref().context("pipeline graph missing")?.launch()?;
+            stream.memcpy_dtoh(&scratch.count, &mut *slot.count_host.as_ref().unwrap().borrow_mut())?;
+            stream.memcpy_dtoh(&scratch.hits, &mut *slot.hits_host.as_ref().unwrap().borrow_mut())?;
+        }
+        slot.done.record(stream)?;
+        Ok(())
+    }
+
+    fn scan_collect(&self, slot_index: usize, problem: &Problem, groups: u32,
+        bound: [u8; 32]) -> Result<Option<Vec<TileResult>>> {
+        let resident = self.base.resident.borrow();
+        let job = resident.as_ref().context("resident job disappeared before scan collection")?;
+        let slot = &self.slots[slot_index];
+        slot.done.synchronize()?;
+        let stream = &slot.stream;
+        let scratch = slot.scratch.borrow();
+        let counters = if let Some(host) = &slot.count_host {
+            if self.mem_mode == ScanMemMode::Pipelined {
+                host.borrow().as_slice()?[..2].to_vec()
+            } else {
+                let mut host = host.borrow_mut();
+                stream.memcpy_dtoh(&scratch.count, &mut *host)?;
+                host.as_slice()?[..2].to_vec()
+            }
+        } else {
+            stream.clone_dtoh(&scratch.count)?
+        };
         ensure!(counters[1] == groups * 128,
             "GPU completed {} tiles, expected {}; refusing to report unconfirmed work", counters[1], groups * 128);
         let count = counters[0];
@@ -588,7 +752,18 @@ impl ProductionCudaKernel {
         if count == 0 {
             return Ok(Some(Vec::new()));
         }
-        let records = stream.clone_dtoh(&scratch.hits.slice(..count as usize * HIT_WORDS))?;
+        let records = if let Some(host) = &slot.hits_host {
+            let len = count as usize * HIT_WORDS;
+            if self.mem_mode == ScanMemMode::Pipelined {
+                host.borrow().as_slice()?[..len].to_vec()
+            } else {
+                let mut host = host.borrow_mut();
+                stream.memcpy_dtoh(&scratch.hits.slice(..len), &mut *host)?;
+                host.as_slice()?[..len].to_vec()
+            }
+        } else {
+            stream.clone_dtoh(&scratch.hits.slice(..count as usize * HIT_WORDS))?
+        };
         let mut tiles = Vec::with_capacity(count as usize);
         for record in records.chunks_exact(HIT_WORDS) {
             let mut tile = problem.empty_tile(record[0], record[1])?;
@@ -616,6 +791,36 @@ impl ProductionCudaKernel {
         );
         Ok(Some(tiles))
     }
+
+    fn scan_once(&self, problem: &Problem, begin: u32, groups: u32,
+        bound: [u8; 32]) -> Result<Option<Vec<TileResult>>> {
+        self.scan_enqueue(0, problem, begin, groups, bound)?;
+        self.scan_collect(0, problem, groups, bound)
+    }
+
+    fn scan_pipeline(&self, problem: &Problem, begin: u32, groups: u32,
+        bound: [u8; 32]) -> Result<Option<Vec<TileResult>>> {
+        let depth = self.slots.len().min(groups as usize);
+        let chunk = groups.div_ceil(depth as u32);
+        let mut pending = Vec::new();
+        let mut offset = 0u32;
+        for slot in 0..depth {
+            if offset == groups { break; }
+            let count = chunk.min(groups - offset);
+            self.scan_enqueue(slot, problem, begin + offset, count, bound)?;
+            pending.push((slot, begin + offset, count));
+            offset += count;
+        }
+        let mut results = Vec::new();
+        for (slot, _start, count) in pending {
+            let Some(mut tiles) = self.scan_collect(slot, problem, count, bound)? else {
+                return Ok(None);
+            };
+            results.append(&mut tiles);
+        }
+        results.sort_by_key(|t| (t.t_rows, t.t_cols));
+        Ok(Some(results))
+    }
 }
 
 fn le_digest_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
@@ -623,6 +828,9 @@ fn le_digest_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 }
 
 impl GemmKernel for ProductionCudaKernel {
+    fn device_memory_info(&self) -> Result<Option<(usize, usize)>> {
+        Ok(Some(self.base.context.mem_get_info()?))
+    }
     fn metadata(&self) -> KernelMetadata {
         KernelMetadata {
             architecture: self.architecture,
@@ -634,8 +842,40 @@ impl GemmKernel for ProductionCudaKernel {
         self.architecture != KernelArchitecture::Sm75Mma
     }
     fn prepare_job(&self, p: &Problem) -> Result<()> {
+        for slot in &self.slots {
+            slot.graph.borrow_mut().take();
+        }
         self.base.resident.borrow_mut().take();
         *self.base.resident.borrow_mut() = Some(self.base.prepare_resident_mode(p, self.device_matrix_preparation())?);
+        self.buffered_c.borrow_mut().take();
+        self.buffered_capacity_groups.set(u32::MAX);
+        if self.mem_mode == ScanMemMode::Buffered {
+            ensure!(p.k() % usize::from(p.config.rank) == 0,
+                "buffered mode requires K divisible by rank");
+            let groups = (p.m / 128).checked_mul(p.n / 128)
+                .context("buffered group count overflow")?;
+            let rank_count = p.k() / usize::from(p.config.rank);
+            let bytes_per_group = rank_count.checked_mul(128 * 128 * std::mem::size_of::<i32>())
+                .context("buffered group size overflow")?;
+            let (free, total) = self.base.context.mem_get_info()?;
+            let currently_used = total.saturating_sub(free);
+            let target_remaining = self.vram_budget_bytes.saturating_sub(currently_used);
+            let available = free.saturating_sub(512 * 1024 * 1024);
+            let wanted = groups.checked_mul(bytes_per_group).context("buffered allocation overflow")?;
+            let bytes = wanted.min(target_remaining).min(available);
+            let capacity = bytes / bytes_per_group;
+            ensure!(capacity > 0, "not enough free VRAM for one buffered C group");
+            let elements = capacity.checked_mul(rank_count * 128 * 128)
+                .context("buffered allocation element count overflow")?;
+            let stream = self.base.context.default_stream();
+            // The GEMM kernel overwrites every element in each submitted batch before hash reads it.
+            let buffer = unsafe { stream.alloc::<i32>(elements)? };
+            *self.buffered_c.borrow_mut() = Some(buffer);
+            self.buffered_capacity_groups.set(u32::try_from(capacity).unwrap_or(u32::MAX));
+            log::info!(target: "pearl_gpu", "buffered C snapshots: {} groups, {:.2} GiB allocated (VRAM target {:.2} GiB)",
+                capacity, elements as f64 * 4.0 / 1024.0_f64.powi(3),
+                self.vram_budget_bytes as f64 / 1024.0_f64.powi(3));
+        }
         Ok(())
     }
     fn batch_size(&self) -> usize {
@@ -667,7 +907,10 @@ impl GemmKernel for ProductionCudaKernel {
         let groups = (p.m / 128)
             .checked_mul(p.n / 128)
             .context("group count overflow")?;
-        Ok(Some((groups, self.groups_per_launch)))
+        let batch = if self.mem_mode == ScanMemMode::Buffered {
+            self.groups_per_launch.min(self.buffered_capacity_groups.get())
+        } else { self.groups_per_launch };
+        Ok(Some((groups, batch)))
     }
 
     fn scan_groups(
@@ -682,7 +925,12 @@ impl GemmKernel for ProductionCudaKernel {
             count > 0 && count <= limit && begin.checked_add(count).is_some_and(|end| end <= total),
             "invalid production group range"
         );
-        if let Some(tiles) = self.scan_once(p, begin, count, bound)? {
+        let scanned = if self.mem_mode == ScanMemMode::Pipelined {
+            self.scan_pipeline(p, begin, count, bound)?
+        } else {
+            self.scan_once(p, begin, count, bound)?
+        };
+        if let Some(tiles) = scanned {
             return Ok(tiles);
         }
         // Never silently lose hits at easy targets. Replay disjoint halves until they fit.
