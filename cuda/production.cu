@@ -80,6 +80,7 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
   uint4 prefetch[LOADS];
   stage_load(a, bt, k, row0, col0, 0, stages[0], prefetch);
   stage_ready(stages[0], prefetch);
+  unsigned next_fold = rank;
   for (unsigned kk = 0; kk < k; kk += BK) {
     const unsigned current = (kk / BK) & 1;
     if (kk + BK < k) stage_load(a, bt, k, row0, col0, kk + BK, stages[current ^ 1], prefetch);
@@ -127,7 +128,10 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
         for (unsigned j = 0; j < 8; ++j) mma_int8(acc[i][j], af[i], bf[j]);
     }
 #endif
-    if ((kk + BK) % rank == 0) {
+    // Host requires rank to be a multiple of BK. Track the next boundary instead
+    // of doing a runtime integer remainder in every K step on every thread.
+    if (kk + BK == next_fold) {
+      next_fold += rank;
       uint32_t fold[8] = {};
 #pragma unroll
       for (unsigned j = 0; j < 8; ++j)
@@ -142,8 +146,10 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
       for (unsigned i = 0; i < 15; ++i) transcript[i] = transcript[i + 1];
       transcript[15] = head;
     }
-    __syncthreads(); // all readers finished before either stage can be reused
+    // stage_ready already ends with a CTA barrier: it protects the current
+    // readers as well as making the next stage visible. Avoid a second barrier.
     if (kk + BK < k) stage_ready(stages[current ^ 1], prefetch);
+    else __syncthreads(); // protect the epilogue's reuse of stage storage
   }
   // Production rank=128/K=4096 has no residual rotation; tests also cover shorter K.
   for (unsigned r = (k / rank) & 15; r != 0; --r) {

@@ -142,3 +142,79 @@ Local validation: `python3 tools/test_profile_production.py` and
 kernel arithmetic with sparse CPU storage at the 4 GiB boundary, not CUDA ABI or
 scheduling. Rust recipe tests cover default compatibility, large deferred shapes
 and invalid dimensions; run `cargo test -p pearl-ref` on an existing Rust host.
+
+## cuBLASLt INT8/INT32 ceiling and power sweep
+
+Build/run the same 56832x56832x4096 shape as the reported Blackwell run:
+
+```sh
+bash tools/run_cublaslt_baseline.sh /tmp/cublaslt-blackwell 56832 56832 4096 5
+```
+
+The baseline uses `CUBLAS_COMPUTE_32I`, `CUDA_R_8I` inputs and `CUDA_R_32I`
+accumulation, queries 16 cuBLASLt heuristic candidates, verifies eight output
+columns against an INT64 CPU dot product, and prints per-algorithm plus best T
+MAC/s. It materializes the full INT32 C matrix (about 12.04 GiB at this shape),
+which matches the expected extra VRAM cost. Its rate is an upper bound for this
+GEMM shape: it excludes Pearl noise, cumulative rank folds, BLAKE3, target tests,
+hit handling and proof generation. It is not a direct miner replacement.
+
+The current miner keeps C in registers and fuses the proof-tile fold and jackpot
+hash into its GEMM epilogue; it does not write a 12 GiB C matrix to global memory.
+Therefore Task 1 is already present in the production scan. The separate
+`MmaSm120CudaKernel` name is used by oracle tests; live mining selects the fused
+`ProductionCudaKernel`.
+
+Run the power sweep only on an idle RTX PRO 6000 with permission to change its
+power limit:
+
+```sh
+bash tools/tune_blackwell_power.sh ./pearl-miner 0
+```
+
+It sweeps 350/400/450/500/600 W using the existing Blackwell waves/band sweep,
+records `nvidia-smi dmon -s pucm` and `nvidia-smi -q -d PERFORMANCE`, writes
+`power-summary.csv` with best scan median, median measured power and T MAC/s/W per
+power setting, and restores the original power limit on exit. Power is summarized
+over each full tuning run, so this is useful for comparing settings but is not a
+synchronized per-kernel energy measurement. NVIDIA may reject limits outside the board's
+supported range; the script exits and attempts restoration. Check the saved
+`manifest.txt` and device logs. It does not change tile shapes: the current fused
+kernel has a fixed 128x128 CTA and eight warps. Implementing the requested
+128x256, 256x128 or four-warp variants requires separate lane mappings and
+correctness acceptance; they are not environment-only tuning knobs.
+
+Profile one scan after the unprofiled sweep (do not use its timed result as
+throughput):
+
+```sh
+ncu --metrics sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_active,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed,l1tex__data_bank_conflicts_pipe_lsu_mem_shared ./pearl-miner --gpu-benchmark --device 0
+```
+
+In a second terminal during the benchmark, capture clocks, power and utilization;
+then query the throttle reasons before and after:
+
+```sh
+nvidia-smi dmon -s pucm -d 1
+nvidia-smi -q -d PERFORMANCE
+```
+
+The workstation has no nvcc, ncu or NVIDIA driver visible in this environment, so
+cuBLASLt measurements, Nsight counters, GPU correctness acceptance and power runs
+were not performed. Record the measured cuBLASLt candidate and the miner rate at
+identical M/N/K, clocks and power before attributing the remaining gap to the
+kernel. NVIDIA documents the INT8/INT32 type combination in the
+[cuBLASLt documentation](https://docs.nvidia.com/cuda/cublas/index.html).
+
+
+## Change log
+
+| Change | Before | After |
+|---|---:|---:|
+| Baseline production scan reported by user | 277.945 T MAC/s | — |
+| Remove redundant CTA barrier and per-step rank remainder | 277.945 T MAC/s | Not measured yet |
+| cuBLASLt INT8/INT32 full-GEMM ceiling | — | Not measured yet |
+
+Run each case at the same matrix shape, GPU clocks and power limit. The first
+number came from the user's miner output; there is no local GPU/toolkit here to
+claim a post-change result or NCU bottleneck.

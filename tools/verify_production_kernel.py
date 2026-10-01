@@ -13,6 +13,16 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+# The production loop tracks rank boundaries instead of dividing at every BK step.
+for rank in (64, 128, 256, 512, 1024):
+    for k in (rank, 2 * rank, 17 * rank, 32 * rank):
+        next_fold = rank
+        boundaries = []
+        for end in range(64, k + 1, 64):
+            if end == next_fold:
+                boundaries.append(end)
+                next_fold += rank
+        assert boundaries == [end for end in range(64, k + 1, 64) if end % rank == 0]
 helpers = (ROOT / "cuda/sm75_mma.cu").read_text().split("__device__ __forceinline__ void mma_int8")[0] + "\n}\n"
 source = (ROOT / "cuda/production.cu").read_text().split("// Exact stateless form")[0].replace('#include "sm75_mma.cu"', helpers)
 source, replacements = re.subn(
