@@ -82,12 +82,18 @@ fn padded_batch_operands(
     let mut bt = vec![0; b_stride.checked_mul(tiles.len()).context("batch B overflow")?];
     for (batch, tile) in tiles.iter().enumerate() {
         for (i, row) in tile.rows.iter().enumerate() {
-            let source = rows.binary_search(row).context("missing batch row")? * k;
+            let source = rows
+                .binary_search(row)
+                .map_err(|_| anyhow::anyhow!("missing batch row"))?
+                * k;
             let target = batch * a_stride + i * k;
             a[target..target + k].copy_from_slice(&unique_a[source..source + k]);
         }
         for (i, col) in tile.cols.iter().enumerate() {
-            let source = cols.binary_search(col).context("missing batch column")? * k;
+            let source = cols
+                .binary_search(col)
+                .map_err(|_| anyhow::anyhow!("missing batch column"))?
+                * k;
             let target = batch * b_stride + i * k;
             bt[target..target + k].copy_from_slice(&unique_bt[source..source + k]);
         }
