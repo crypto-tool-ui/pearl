@@ -83,7 +83,7 @@ jobs:
         with:
           cuda: "13.0.0"
           method: network
-          sub-packages: '["nvcc", "cudart-dev", "cccl", "cuobjdump"]'
+          sub-packages: '["nvcc", "cudart-dev", "cccl", "cuobjdump", "nvdisasm"]'
       - name: Build miner with embedded sm_75, sm_90a and sm_120a cubins
         run: |
           nvcc --version
@@ -94,6 +94,7 @@ jobs:
           target/release/pearl-miner --benchmark
       - name: Verify CUDA kernels without a GPU
         run: |
+          nvdisasm --version
           bash tools/check_sm75_sass.sh
           bash tools/check_sm120_sass.sh
           bash tools/check_sm90_sass.sh
