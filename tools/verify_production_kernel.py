@@ -107,13 +107,14 @@ int main() {
     for(auto &x:b) x=int(rng()%255)-127;
     uint8_t seed[32]; for(auto &x:seed) x=rng();
     uint32_t bound[8]; std::fill(bound,bound+8,0xffffffffu);
+    const unsigned begin_ptr=begin, groups_ptr=1;
     std::vector<uint32_t> hits(128*26+16,0xdeadbeefu); unsigned counters[2]={}; unsigned &count=counters[0];
     auto run=[&](unsigned capacity) {
       count=0; counters[1]=0; blockIdx.x=0;
       std::vector<std::thread> threads;
       for(unsigned t=0;t<EMU_THREADS;++t) threads.emplace_back([&,t] {
         threadIdx.x=t;
-        pearl_production_scan(a.data(),b.data(),m,n,k,rank,begin,band,seed,bound,capacity,&count,hits.data());
+        pearl_production_scan(a.data(),b.data(),m,n,k,rank,&begin_ptr,&groups_ptr,band,seed,bound,capacity,&count,hits.data(),nullptr);
       });
       for(auto &t:threads)t.join();
       if(counters[1]!=128) throw std::runtime_error("device work counter mismatch");
