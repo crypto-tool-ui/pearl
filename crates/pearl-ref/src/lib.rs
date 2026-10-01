@@ -47,6 +47,14 @@ impl Matrix {
     }
     pub fn recipe(&self) -> Option<(u64, u64, usize)> { self.recipe }
     pub fn is_materialized(&self) -> bool { self.values.get().is_some() }
+    /// Inspect the shape without generating deferred matrix bytes through Deref.
+    pub fn len(&self) -> usize {
+        match self.recipe {
+            Some((_, _, len)) => len,
+            None => self.values.get().expect("materialized matrix values").len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
 impl From<Vec<i8>> for Matrix {
     fn from(values: Vec<i8>) -> Self {
@@ -783,13 +791,18 @@ mod deferred_matrix_tests {
     use super::*;
     #[test]
     fn deferred_matrix_matches_eager_bytes_and_shares_storage() {
-        for len in [1, 7, 8, 9, 1024, 4097] {
+        for len in [0, 1, 7, 8, 9, 1024, 4097] {
             let matrix = Matrix::generated(u64::MAX, 0x123456789abcdef0, len);
             let clone = matrix.clone();
+            assert_eq!(matrix.len(), len);
+            assert_eq!(matrix.is_empty(), len == 0);
             assert!(!matrix.is_materialized());
             assert_eq!(&*matrix, fill_int7(u64::MAX, 0x123456789abcdef0, len));
             assert!(clone.is_materialized());
             assert_eq!(matrix.as_ptr(), clone.as_ptr());
+            let eager = Matrix::from(vec![0; len]);
+            assert_eq!(eager.len(), len);
+            assert_eq!(eager.is_empty(), len == 0);
         }
     }
     #[test]
