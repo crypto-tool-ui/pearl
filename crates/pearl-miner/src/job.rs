@@ -21,7 +21,7 @@ pub fn problem_for_job(job: &PoolJob) -> Result<Problem> {
 ///
 /// A tile is considered a candidate only after the GPU returns its fused digest. The CPU
 /// reference then reconstructs the official Merkle proof and verifier before the caller can submit
-/// it. The loop checks the current job boundary between tiles so a supervisor can cancel work on a
+/// it. The loop checks the current job boundary between batches so a supervisor can cancel work on a
 /// future job update.
 pub fn find_verified_share(
     problem: &Problem,
@@ -40,26 +40,42 @@ pub fn find_verified_share(
     let mut scanned = 0usize;
     let started = Instant::now();
 
-    for t_rows in row_offsets {
-        for t_cols in &col_offsets {
-            if should_cancel() {
-                warn!(job_id = %job.job_id, scanned, "Kryptex job cancelled as stale");
-                return Ok(None);
-            }
-            let request = problem.empty_tile(t_rows, *t_cols)?;
-            let tile = kernel
-                .compute_tile(problem, &request)
-                .with_context(|| format!("computing Kryptex tile ({t_rows},{t_cols})"))?;
-            scanned += 1;
+    let batch_size = kernel.max_batch_size();
+    ensure!(batch_size > 0, "GPU kernel reported a zero tile batch size");
+    let mut offsets = row_offsets
+        .into_iter()
+        .flat_map(|t_rows| col_offsets.iter().copied().map(move |t_cols| (t_rows, t_cols)));
+    loop {
+        if should_cancel() {
+            warn!(job_id = %job.job_id, scanned, "Kryptex job cancelled as stale");
+            return Ok(None);
+        }
+        let mut requests = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            let Some((t_rows, t_cols)) = offsets.next() else { break };
+            requests.push(problem.empty_tile(t_rows, t_cols)?);
+        }
+        if requests.is_empty() {
+            break;
+        }
+        let computed = kernel.compute_tiles(problem, &requests)
+            .context("computing Kryptex tile batch")?;
+        ensure!(computed.len() == requests.len(), "GPU returned an incomplete tile batch");
+        if should_cancel() {
+            return Ok(None);
+        }
+        scanned += computed.len();
+        for tile in computed {
+            let (t_rows, t_cols) = (tile.t_rows, tile.t_cols);
             if U256::from_little_endian(&tile.digest) > bound {
                 continue;
             }
             debug!(job_id = %job.job_id, t_rows, t_cols, scanned, "GPU candidate reached share bound");
             let elapsed = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
             let operations = (scanned as u128)
-                .saturating_mul(problem.m as u128)
-                .saturating_mul(problem.n as u128)
-                .saturating_mul(problem.k() as u128);
+                .saturating_mul(tile.rows.len() as u128)
+                .saturating_mul(tile.cols.len() as u128)
+                .saturating_mul(problem.config.dot_product_length() as u128);
             let hashrate = (operations as f64 / elapsed)
                 .min(u64::MAX as f64)
                 .max(0.0) as u64;

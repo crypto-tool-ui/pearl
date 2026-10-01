@@ -222,9 +222,18 @@ impl Problem {
             "tile cols do not match problem"
         );
 
+        self.noised_operands_for_indices(&tile.rows, &tile.cols)
+    }
+
+    /// Generates official noise once for a set of rows and columns shared by a tile batch.
+    pub fn noised_operands_for_indices(&self, rows: &[u32], cols: &[u32]) -> Result<(Vec<i8>, Vec<i8>)> {
+        ensure!(rows.iter().all(|&row| row < self.m), "row out of bounds");
+        ensure!(cols.iter().all(|&col| col < self.n), "column out of bounds");
+        let rank = self.config.rank as usize;
+        ensure!(rank.is_power_of_two() && rank % 32 == 0, "noise rank must be a power of two and divisible by 32");
         let commitment = self.commitment();
-        let row_indices: Vec<usize> = tile.rows.iter().map(|&row| row as usize).collect();
-        let col_indices: Vec<usize> = tile.cols.iter().map(|&col| col as usize).collect();
+        let row_indices: Vec<usize> = rows.iter().map(|&row| row as usize).collect();
+        let col_indices: Vec<usize> = cols.iter().map(|&col| col as usize).collect();
         let noise = compute_noise_for_indices(
             self.k(),
             self.config.rank as usize,
@@ -233,8 +242,8 @@ impl Problem {
             &col_indices,
         );
 
-        let mut a = Vec::with_capacity(tile.rows.len() * self.k());
-        for (u, &row) in tile.rows.iter().enumerate() {
+        let mut a = Vec::with_capacity(rows.len() * self.k());
+        for (u, &row) in rows.iter().enumerate() {
             for l in 0..self.k() {
                 let value = self.a[row as usize * self.k() + l] as i32 + noise.a[u][l] as i32;
                 ensure!(
@@ -245,8 +254,8 @@ impl Problem {
             }
         }
 
-        let mut bt = Vec::with_capacity(tile.cols.len() * self.k());
-        for (v, &col) in tile.cols.iter().enumerate() {
+        let mut bt = Vec::with_capacity(cols.len() * self.k());
+        for (v, &col) in cols.iter().enumerate() {
             for l in 0..self.k() {
                 let value = self.bt[col as usize * self.k() + l] as i32 + noise.b[v][l] as i32;
                 ensure!(

@@ -5,12 +5,13 @@ use crate::{
 };
 use anyhow::{bail, ensure, Context, Result};
 use cudarc::driver::{result, sys, CudaContext, DevicePtr, DevicePtrMut};
-use pearl_ref::{compute_jackpot_hash, MMAType, Problem, TileResult};
+use pearl_ref::{compute_jackpot_hash, Problem, TileResult};
 use std::{ffi::c_void, sync::Arc};
 const SM75_MMA_M: usize = 8;
 const SM75_MMA_N: usize = 8;
 const SM75_MMA_K: usize = 16;
 const SM75_MAX_WARPS: usize = 32;
+const SM75_TILE_BATCH_SIZE: usize = 128;
 
 pub struct MmaSm75CudaKernel {
     context: Arc<CudaContext>,
@@ -78,70 +79,6 @@ impl MmaSm75CudaKernel {
         })
     }
 
-    fn padded_operands(
-        problem: &Problem,
-        tile: &TileResult,
-    ) -> Result<(Vec<i8>, Vec<i8>, u32, u32)> {
-        ensure!(
-            problem.config.mma_type == MMAType::Int7xInt7ToInt32,
-            "sm_75 kernel only supports the official V3 INT8 representation"
-        );
-        ensure!(
-            problem.config.moe.is_none(),
-            "sm_75 dense kernel does not support grouped GEMM"
-        );
-        let (a, bt) = problem.noised_tile_operands(tile)?;
-        let h = tile.rows.len();
-        let w = tile.cols.len();
-        let k = problem.k();
-        ensure!(h > 0 && w > 0, "sm_75 kernel requires a non-empty tile");
-        ensure!(
-            h <= u32::MAX as usize,
-            "sm_75 row count exceeds CUDA parameter width"
-        );
-        ensure!(
-            w <= u32::MAX as usize,
-            "sm_75 column count exceeds CUDA parameter width"
-        );
-        let padded_h = h
-            .checked_add(SM75_MMA_M - 1)
-            .context("sm_75 padded row count overflow")?
-            / SM75_MMA_M;
-        let padded_h = padded_h
-            .checked_mul(SM75_MMA_M)
-            .context("sm_75 padded row count overflow")?;
-        let padded_w = w
-            .checked_add(SM75_MMA_N - 1)
-            .context("sm_75 padded column count overflow")?
-            / SM75_MMA_N;
-        let padded_w = padded_w
-            .checked_mul(SM75_MMA_N)
-            .context("sm_75 padded column count overflow")?;
-        ensure!(
-            padded_h <= u32::MAX as usize,
-            "sm_75 padded rows exceed CUDA parameter width"
-        );
-        ensure!(
-            padded_w <= u32::MAX as usize,
-            "sm_75 padded columns exceed CUDA parameter width"
-        );
-        let padded_a_len = padded_h
-            .checked_mul(k)
-            .context("sm_75 padded A size overflow")?;
-        let padded_bt_len = padded_w
-            .checked_mul(k)
-            .context("sm_75 padded B^T size overflow")?;
-        let mut padded_a = vec![0i8; padded_a_len];
-        let mut padded_bt = vec![0i8; padded_bt_len];
-        for row in 0..h {
-            padded_a[row * k..(row + 1) * k].copy_from_slice(&a[row * k..(row + 1) * k]);
-        }
-        for row in 0..w {
-            padded_bt[row * k..(row + 1) * k].copy_from_slice(&bt[row * k..(row + 1) * k]);
-        }
-        Ok((padded_a, padded_bt, padded_h as u32, padded_w as u32))
-    }
-
     fn launch_transcript(
         &self,
         a: &[i8],
@@ -153,9 +90,12 @@ impl MmaSm75CudaKernel {
         physical_k: u32,
         effective_k: u32,
         rank: u32,
+        tile_count: u32,
         a_noise_seed: &[u8; 32],
-    ) -> Result<([u32; 16], [u8; 32])> {
+    ) -> Result<(Vec<[u32; 16]>, Vec<[u8; 32]>)> {
         ensure!(rank > 0, "sm_75 kernel requires a nonzero rank");
+        ensure!(tile_count > 0 && tile_count as usize <= SM75_TILE_BATCH_SIZE,
+            "sm_75 tile count is out of range");
         ensure!(
             logical_h > 0 && logical_w > 0,
             "sm_75 kernel requires a non-empty tile"
@@ -174,14 +114,12 @@ impl MmaSm75CudaKernel {
         let expected_bt_len = (padded_w as usize)
             .checked_mul(physical_k as usize)
             .context("sm_75 B^T operand length overflow")?;
-        ensure!(
-            a.len() == expected_a_len,
-            "sm_75 A operand length does not match its stride"
-        );
-        ensure!(
-            bt.len() == expected_bt_len,
-            "sm_75 B^T operand length does not match its stride"
-        );
+        let expected_batch_a = expected_a_len.checked_mul(tile_count as usize)
+            .context("sm_75 A batch size overflow")?;
+        let expected_batch_bt = expected_bt_len.checked_mul(tile_count as usize)
+            .context("sm_75 B^T batch size overflow")?;
+        ensure!(a.len() == expected_batch_a, "sm_75 A operand length does not match its batch");
+        ensure!(bt.len() == expected_batch_bt, "sm_75 B^T operand length does not match its batch");
         let tiles_m = (padded_h as usize).div_ceil(SM75_MMA_M);
         let tiles_n = (padded_w as usize).div_ceil(SM75_MMA_N);
         let warps = tiles_m
@@ -218,12 +156,10 @@ impl MmaSm75CudaKernel {
             effective_k > 0,
             "sm_75 kernel requires a non-empty effective K"
         );
-        let accumulator_cells = (logical_h as usize)
-            .checked_mul(logical_w as usize)
-            .context("sm_75 accumulator cell count overflow")?;
-        let accumulator_bytes = accumulator_cells
-            .checked_mul(std::mem::size_of::<i32>())
-            .context("sm_75 accumulator shared-memory size overflow")?;
+        // One XOR partial per warp; accumulators remain in registers.
+        let accumulator_bytes = (warps as usize)
+            .checked_mul(std::mem::size_of::<u32>())
+            .context("sm_75 fold shared-memory size overflow")?;
         let shared_bytes = accumulator_bytes;
         ensure!(
             shared_bytes <= u32::MAX as usize,
@@ -257,22 +193,22 @@ impl MmaSm75CudaKernel {
             .clone_htod(bt)
             .context("copying padded B^T tile to CUDA")?;
         let mut d_transcript = stream
-            .alloc_zeros::<u32>(16)
+            .alloc_zeros::<u32>(16 * tile_count as usize)
             .context("allocating sm_75 transcript")?;
         let mut d_digest = stream
-            .alloc_zeros::<u8>(32)
+            .alloc_zeros::<u8>(32 * tile_count as usize)
             .context("allocating sm_75 digest")?;
         let d_a_noise_seed = stream
             .clone_htod(a_noise_seed)
             .context("copying sm_75 A noise seed to CUDA")?;
-        (|| -> Result<([u32; 16], [u8; 32])> {
+        (|| -> Result<(Vec<[u32; 16]>, Vec<[u8; 32]>)> {
             {
                 let (a_ptr, _a_sync) = d_a.device_ptr(&stream);
                 let (bt_ptr, _bt_sync) = d_bt.device_ptr(&stream);
                 let (transcript_ptr, _transcript_sync) = d_transcript.device_ptr_mut(&stream);
                 let (a_noise_seed_ptr, _a_noise_seed_sync) = d_a_noise_seed.device_ptr(&stream);
                 let (digest_ptr, _digest_sync) = d_digest.device_ptr_mut(&stream);
-                let mut params: [*mut c_void; 12] = [
+                let mut params: [*mut c_void; 13] = [
                     (&a_ptr as *const sys::CUdeviceptr).cast_mut().cast(),
                     (&bt_ptr as *const sys::CUdeviceptr).cast_mut().cast(),
                     (&logical_h as *const u32).cast_mut().cast(),
@@ -282,6 +218,7 @@ impl MmaSm75CudaKernel {
                     (&physical_k as *const u32).cast_mut().cast(),
                     (&effective_k as *const u32).cast_mut().cast(),
                     (&rank as *const u32).cast_mut().cast(),
+                    (&tile_count as *const u32).cast_mut().cast(),
                     (&transcript_ptr as *const sys::CUdeviceptr)
                         .cast_mut()
                         .cast(),
@@ -293,7 +230,7 @@ impl MmaSm75CudaKernel {
                 unsafe {
                     result::launch_kernel(
                         self.kernel.function,
-                        (1, 1, 1),
+                        (tile_count, 1, 1),
                         (threads as u32, 1, 1),
                         shared_bytes as u32,
                         stream.cu_stream(),
@@ -305,17 +242,19 @@ impl MmaSm75CudaKernel {
             stream
                 .synchronize()
                 .context("synchronizing pearl_sm75_mma_tile")?;
-            let transcript = stream
+            let transcript_words = stream
                 .clone_dtoh(&d_transcript)
-                .context("copying sm_75 transcript from CUDA")?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("sm_75 transcript had the wrong length"))?;
-            let digest = stream
+                .context("copying sm_75 transcripts from CUDA")?;
+            let digests = stream
                 .clone_dtoh(&d_digest)
-                .context("copying sm_75 digest from CUDA")?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("sm_75 digest had the wrong length"))?;
-            Ok((transcript, digest))
+                .context("copying sm_75 digests from CUDA")?;
+            let transcripts = transcript_words.chunks_exact(16)
+                .map(|words| words.try_into().expect("fixed transcript chunk"))
+                .collect();
+            let digests = digests.chunks_exact(32)
+                .map(|bytes| bytes.try_into().expect("fixed digest chunk"))
+                .collect();
+            Ok((transcripts, digests))
         })()
     }
 }
@@ -330,35 +269,52 @@ impl GemmKernel for MmaSm75CudaKernel {
     }
 
     fn compute_tile(&self, problem: &Problem, tile: &TileResult) -> Result<TileResult> {
-        let (a, bt, padded_h, padded_w) = Self::padded_operands(problem, tile)?;
+        self.compute_tiles(problem, std::slice::from_ref(tile))?
+            .pop()
+            .context("sm_75 returned an empty tile batch")
+    }
+
+    fn max_batch_size(&self) -> usize {
+        SM75_TILE_BATCH_SIZE
+    }
+
+    fn compute_tiles(&self, problem: &Problem, tiles: &[TileResult]) -> Result<Vec<TileResult>> {
+        ensure!(!tiles.is_empty(), "sm_75 tile batch cannot be empty");
+        ensure!(tiles.len() <= SM75_TILE_BATCH_SIZE, "sm_75 tile batch is too large");
+        let first = &tiles[0];
+        let logical_h = first.rows.len();
+        let logical_w = first.cols.len();
+        let (a, bt, padded_h, padded_w) =
+            crate::padded_batch_operands(problem, tiles, SM75_MMA_M, SM75_MMA_N)?;
         let rank = problem.config.rank as usize;
         ensure!(rank > 0, "sm_75 kernel requires a nonzero rank");
         let effective_k = (problem.k() / rank) * rank;
         let commitment = problem.commitment();
-        let (transcript, digest) = self.launch_transcript(
+        let (transcripts, digests) = self.launch_transcript(
             &a,
             &bt,
-            tile.rows.len() as u32,
-            tile.cols.len() as u32,
+            logical_h as u32,
+            logical_w as u32,
             padded_h,
             padded_w,
             problem.k() as u32,
             effective_k as u32,
             rank as u32,
+            tiles.len() as u32,
             &commitment.a_noise_seed,
         )?;
-        let expected_digest = compute_jackpot_hash(&transcript, commitment.a_noise_seed);
-        ensure!(
-            digest == expected_digest,
-            "sm_75 fused BLAKE3 digest does not match the returned transcript"
-        );
-        Ok(TileResult {
-            t_rows: tile.t_rows,
-            t_cols: tile.t_cols,
-            rows: tile.rows.clone(),
-            cols: tile.cols.clone(),
-            transcript,
-            digest,
-        })
+        tiles.iter().zip(transcripts).zip(digests).map(|((tile, transcript), digest)| {
+            let expected_digest = compute_jackpot_hash(&transcript, commitment.a_noise_seed);
+            ensure!(digest == expected_digest,
+                "sm_75 fused BLAKE3 digest does not match the returned transcript");
+            Ok(TileResult {
+                t_rows: tile.t_rows,
+                t_cols: tile.t_cols,
+                rows: tile.rows.clone(),
+                cols: tile.cols.clone(),
+                transcript,
+                digest,
+            })
+        }).collect()
     }
 }

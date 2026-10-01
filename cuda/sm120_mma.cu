@@ -225,11 +225,14 @@ extern "C" __global__ void pearl_sm120_mma_tile(
     uint32_t physical_k,
     uint32_t effective_k,
     uint32_t rank,
+    uint32_t tile_count,
     uint32_t* transcript,
     const uint8_t* a_noise_seed,
     uint8_t* digest) {
   const uint32_t lane = threadIdx.x & 31;
   const uint32_t warp = threadIdx.x >> 5;
+  const uint32_t tile = blockIdx.x;
+  if (tile >= tile_count) return;
   if (padded_h == 0 || padded_w == 0) {
     return;
   }
@@ -247,9 +250,13 @@ extern "C" __global__ void pearl_sm120_mma_tile(
 
   extern __shared__ uint8_t shared[];
   uint8_t* stages = shared;
-  int32_t* accum = reinterpret_cast<int32_t*>(shared + 2 * warps * kStageBytes);
+  uint32_t* warp_folds = reinterpret_cast<uint32_t*>(shared + 2 * warps * kStageBytes);
   uint8_t* warp_stage0 = stages + warp * kStageBytes * 2;
   uint8_t* warp_stage1 = warp_stage0 + kStageBytes;
+  a += static_cast<uint64_t>(tile) * padded_h * physical_k;
+  bt += static_cast<uint64_t>(tile) * padded_w * physical_k;
+  transcript += static_cast<uint64_t>(tile) * 16;
+  digest += static_cast<uint64_t>(tile) * 32;
 
   int32_t d[4] = {0, 0, 0, 0};
   for (uint32_t slice_begin = 0; slice_begin < effective_k; slice_begin += rank) {
@@ -300,19 +307,24 @@ extern "C" __global__ void pearl_sm120_mma_tile(
     const uint32_t col_base = warp_n * kMmaN;
     const uint32_t group = lane >> 2;
     const uint32_t thread = lane & 3;
+    uint32_t lane_fold = 0;
     for (uint32_t i = 0; i < 4; ++i) {
       const uint32_t row = row_base + group + (i / 2) * 8;
       const uint32_t col = col_base + thread * 2 + (i & 1);
       if (row < logical_h && col < logical_w) {
-        accum[row * logical_w + col] = d[i];
+        lane_fold ^= static_cast<uint32_t>(d[i]);
       }
     }
+    // All lanes participate; padded cells contribute zero.
+    for (uint32_t delta = 16; delta > 0; delta >>= 1)
+      lane_fold ^= __shfl_down_sync(0xffffffffu, lane_fold, delta);
+    if (lane == 0) warp_folds[warp] = lane_fold;
     __syncthreads();
 
     if (threadIdx.x == 0) {
       uint32_t fold = 0;
-      for (uint32_t cell = 0; cell < logical_h * logical_w; ++cell) {
-        fold ^= static_cast<uint32_t>(accum[cell]);
+      for (uint32_t cell = 0; cell < warps; ++cell) {
+        fold ^= warp_folds[cell];
       }
       const uint32_t slot = (slice_begin / rank) & 15;
       transcript[slot] = (transcript[slot] << 13 | transcript[slot] >> 19) ^ fold;

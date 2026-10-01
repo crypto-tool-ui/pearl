@@ -23,7 +23,7 @@ fn skip_gpu(reason: &str) {
 }
 
 #[test]
-fn naive_cuda_matches_cpu_golden_tile() {
+fn sm120_mma_and_naive_match_cpu_golden_tiles() {
     if option_env!("PEARL_NAIVE_CUBIN_SM90").is_none()
         && option_env!("PEARL_NAIVE_CUBIN_SM120").is_none()
     {
@@ -63,6 +63,19 @@ fn naive_cuda_matches_cpu_golden_tile() {
     };
     let actual = mma.compute_tile(&problem, &expected).unwrap();
     assert_eq!(actual, expected);
+    let (rows, cols) = problem.tile_offsets();
+    let requests: Vec<_> = rows.iter().flat_map(|&r| cols.iter().map(move |&c| (r, c)))
+        .take(mma.max_batch_size())
+        .map(|(r, c)| problem.empty_tile(r, c).unwrap()).collect();
+    let golden: Vec<_> = requests.iter()
+        .map(|t| problem.tile(t.t_rows, t.t_cols).unwrap()).collect();
+    assert_eq!(mma.compute_tiles(&problem, &requests).unwrap(), golden);
+    // Partial batches, duplicate tiles, and non-monotonic offsets exercise output strides.
+    let reordered = [requests.last().unwrap().clone(), requests[0].clone(), requests[0].clone()];
+    let golden: Vec<_> = reordered.iter()
+        .map(|t| problem.tile(t.t_rows, t.t_cols).unwrap()).collect();
+    assert_eq!(mma.compute_tiles(&problem, &reordered).unwrap(), golden);
+
 }
 
 #[test]
@@ -205,7 +218,6 @@ fn sm120_mma_benchmark() {
     let operations = tile.rows.len() as f64
         * tile.cols.len() as f64
         * problem.config.dot_product_length() as f64
-        * 2.0
         * iterations as f64;
     let effective_ths = operations / seconds / 1.0e12;
     println!(
@@ -370,7 +382,6 @@ fn sm90_wgmma_benchmark() {
     let operations = tile.rows.len() as f64
         * tile.cols.len() as f64
         * problem.config.dot_product_length() as f64
-        * 2.0
         * iterations as f64;
     let effective_ths = operations / seconds / 1.0e12;
     println!(

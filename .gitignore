@@ -1,6 +1,7 @@
 /target/
 /pearl/
 /spark-pearl-miner/
+/distributed-torch-flashatt-t4/
 /.cargo/
 *.swp
 IAminer

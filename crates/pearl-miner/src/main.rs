@@ -197,7 +197,6 @@ fn run_benchmark() -> Result<()> {
     let operations = tile.rows.len() as f64
         * tile.cols.len() as f64
         * problem.config.dot_product_length() as f64
-        * 2.0
         * f64::from(iterations);
     println!(
         "CPU reference benchmark: {:.2} tiles/s, {:.3} effective TH/s",

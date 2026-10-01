@@ -100,9 +100,12 @@ extern "C" __global__ void pearl_sm75_mma_tile(
     uint32_t logical_h, uint32_t logical_w,
     uint32_t padded_h, uint32_t padded_w,
     uint32_t physical_k, uint32_t effective_k, uint32_t rank,
+    uint32_t tile_count,
     uint32_t* transcript, const uint8_t* a_noise_seed, uint8_t* digest) {
   // Uniform checks: every thread in this CTA reaches every block barrier.
   const uint32_t warps = (padded_h / 8) * (padded_w / 8);
+  const uint32_t tile = blockIdx.x;
+  if (tile >= tile_count) return;
   if (!logical_h || !logical_w || logical_h > padded_h || logical_w > padded_w ||
       padded_h % 8 || padded_w % 8 || !warps || warps > 32 ||
       blockDim.x != warps * 32 || !rank || rank % 16 ||
@@ -111,9 +114,13 @@ extern "C" __global__ void pearl_sm75_mma_tile(
   const uint32_t warp = threadIdx.x >> 5;
   const uint32_t row_base = (warp / (padded_w / 8)) * 8;
   const uint32_t col_base = (warp % (padded_w / 8)) * 8;
+  a += static_cast<uint64_t>(tile) * padded_h * physical_k;
+  bt += static_cast<uint64_t>(tile) * padded_w * physical_k;
+  transcript += static_cast<uint64_t>(tile) * 16;
+  digest += static_cast<uint64_t>(tile) * 32;
   const uint32_t group = lane >> 2;
   const uint32_t thread = lane & 3;
-  extern __shared__ int32_t accum[];
+  extern __shared__ uint32_t warp_folds[];
   int32_t d[2] = {0, 0};
   // Keep d cumulative across rank slices; each boundary folds the running product.
   for (uint32_t slice = 0; slice < effective_k; slice += rank) {
@@ -126,15 +133,20 @@ extern "C" __global__ void pearl_sm75_mma_tile(
       mma_int8(d, af, bf);
     }
     const uint32_t row = row_base + group;
+    uint32_t lane_fold = 0;
     for (uint32_t i = 0; i < 2; ++i) {
       const uint32_t col = col_base + thread * 2 + i;
-      if (row < logical_h && col < logical_w) accum[row * logical_w + col] = d[i];
+      if (row < logical_h && col < logical_w) lane_fold ^= static_cast<uint32_t>(d[i]);
     }
+    // All lanes participate; padded cells contribute zero.
+    for (uint32_t delta = 16; delta > 0; delta >>= 1)
+      lane_fold ^= __shfl_down_sync(0xffffffffu, lane_fold, delta);
+    if (lane == 0) warp_folds[warp] = lane_fold;
     __syncthreads();
     if (threadIdx.x == 0) {
       uint32_t fold = 0;
-      for (uint32_t cell = 0; cell < logical_h * logical_w; ++cell)
-        fold ^= static_cast<uint32_t>(accum[cell]);
+      for (uint32_t cell = 0; cell < warps; ++cell)
+        fold ^= warp_folds[cell];
       const uint32_t slot = (slice / rank) & 15;
       transcript[slot] = (transcript[slot] << 13 | transcript[slot] >> 19) ^ fold;
     }

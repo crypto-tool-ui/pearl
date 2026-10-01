@@ -38,9 +38,12 @@ instruction. The host pads the selected logical tile to 16 rows by 8 columns wit
 the logical dimensions still control the transcript fold. Each warp owns one padded subtile. The
 kernel uses two shared-memory stages, `cp.async` global-to-shared copies, `ldmatrix` loads, and a
 register-resident int32 accumulator. It writes only the logical accumulators to shared memory for
-the fused XOR/rotate transcript update and never writes a full GEMM tile to global memory.
+the fused XOR/rotate transcript update and never writes a full GEMM tile to global memory. The
+sm_120 miner batches 128 independent jackpot tiles per launch, with one block per tile, so many
+small 8×16 production tiles can run concurrently. Standalone `compute_tile` calls use the same
+kernel with one block.
 The source has a compile-time `__CUDA_ARCH__ == 1200` guard so an sm_90 or generic build cannot
-silently produce a mismatched cubin. One launch is capped at 32 warps; the host checks this before
+silently produce a mismatched cubin. Each block is capped at 32 warps; the host checks this before
 launch and the kernel repeats the guard for direct callers.
 
 The host passes both the physical row stride and the official rank-truncated effective K length,
@@ -156,7 +159,8 @@ Operands are zero-padded to 8×8; only logical cells enter the transcript fold.
 Accumulators remain cumulative across rank boundaries, and the kernel hashes the
 transcript with the official keyed BLAKE3 single-block root parameters.
 Only accumulator scratch uses dynamic shared memory; no cp.async/TMA is used.
-The adapter checks shape alignment, block limits and shared-memory limits.
+The adapter checks shape alignment, block limits and shared-memory limits. The miner batches up to
+128 independent hash tiles per launch. This is not the reference miner’s larger GEMM macrotile: operands are still packed and uploaded per batch.
 
 The cubin is embedded with the other architectures and capability 7.5 selects it
 in production dispatch. Run `bash tools/check_sm75_sass.sh` for compilation and
