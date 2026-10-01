@@ -308,7 +308,7 @@ extern "C" __global__ void pearl_sm90_wgmma_tile(
       const uint64_t desc_a = make_k_major_desc(current_stage);
       const uint64_t desc_b = make_k_major_desc(current_stage + kAStageBytes);
       wgmma_fence();
-      if ((step % (rank / kMmaK)) == 0) wgmma_zero(d, desc_a, desc_b);
+      if (step == 0) wgmma_zero(d, desc_a, desc_b);
       else wgmma_accumulate(d, desc_a, desc_b);
       wgmma_commit_wait();
     }
@@ -348,7 +348,7 @@ extern "C" __global__ void pearl_sm90_wgmma_tile(
         transcript[slot] = (transcript[slot] << 13 | transcript[slot] >> 19) ^ fold;
       }
       __syncthreads();
-      if (!producer) d[0] = d[1] = d[2] = d[3] = 0;
+      // V3 folds the cumulative product; retain d across rank boundaries.
     }
   }
 

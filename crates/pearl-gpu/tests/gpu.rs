@@ -205,7 +205,6 @@ fn sm120_mma_benchmark() {
     let operations = tile.rows.len() as f64
         * tile.cols.len() as f64
         * problem.config.dot_product_length() as f64
-        * 2.0
         * iterations as f64;
     let effective_ths = operations / seconds / 1.0e12;
     println!(
@@ -370,7 +369,6 @@ fn sm90_wgmma_benchmark() {
     let operations = tile.rows.len() as f64
         * tile.cols.len() as f64
         * problem.config.dot_product_length() as f64
-        * 2.0
         * iterations as f64;
     let effective_ths = operations / seconds / 1.0e12;
     println!(

@@ -63,7 +63,8 @@ pub fn scan_job(
     let (row_offsets, col_offsets) = problem.tile_offsets();
     let total = row_offsets.len().saturating_mul(col_offsets.len());
     let tile_work = problem.config.rows_pattern.size() as f64
-        * problem.config.cols_pattern.size() as f64 * problem.k() as f64;
+        * problem.config.cols_pattern.size() as f64
+        * problem.config.dot_product_length() as f64;
     let mut scanned = 0usize;
     let mut candidates = 0usize;
     let mean_tiles_per_share = expected_tiles_per_share(bound);
@@ -97,7 +98,7 @@ pub fn scan_job(
             let count = batch.min(groups - group_cursor);
             let hits = kernel.scan_groups(problem, group_cursor, count, bound_bytes)?;
             group_cursor += count;
-            (hits, count as usize * 128, 128.0 * problem.k() as f64)
+            (hits, count as usize * 128, tile_work)
         } else {
             let requests = offsets
                 .by_ref()
@@ -114,8 +115,9 @@ pub fn scan_job(
                 tiles.len() == requests.len(),
                 "GPU returned an incomplete tile batch"
             );
-            let work =
-                requests[0].rows.len() as f64 * requests[0].cols.len() as f64 * problem.k() as f64;
+            let work = requests[0].rows.len() as f64
+                * requests[0].cols.len() as f64
+                * problem.config.dot_product_length() as f64;
             (tiles, requests.len(), work)
         };
         if should_cancel() {
@@ -149,7 +151,8 @@ pub fn scan_job(
     }
     let elapsed = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
     let tile_work = problem.config.rows_pattern.size() as f64
-        * problem.config.cols_pattern.size() as f64 * problem.k() as f64;
+        * problem.config.cols_pattern.size() as f64
+        * problem.config.dot_product_length() as f64;
     debug!("全タイルの処理が完了しました | ジョブ={} | 処理済み={} | GPU候補={} | 平均={} | スキャン速度={} | 平均シェア間隔秒={:.0}",
         job.job_id, scanned, candidates, format_hashrate(scanned as f64 * tile_work / elapsed),
         format_hashrate(scanned as f64 * tile_work / scan_started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE)),
