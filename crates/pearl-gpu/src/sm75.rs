@@ -852,8 +852,9 @@ impl GemmKernel for ProductionCudaKernel {
         if self.mem_mode == ScanMemMode::Buffered {
             ensure!(p.k() % usize::from(p.config.rank) == 0,
                 "buffered mode requires K divisible by rank");
-            let groups = (p.m / 128).checked_mul(p.n / 128)
-                .context("buffered group count overflow")?;
+            let groups = usize::try_from((p.m / 128).checked_mul(p.n / 128)
+                .context("buffered group count overflow")?)
+                .context("buffered group count does not fit usize")?;
             let rank_count = p.k() / usize::from(p.config.rank);
             let bytes_per_group = rank_count.checked_mul(128 * 128 * std::mem::size_of::<i32>())
                 .context("buffered group size overflow")?;
@@ -863,15 +864,17 @@ impl GemmKernel for ProductionCudaKernel {
             let available = free.saturating_sub(512 * 1024 * 1024);
             let wanted = groups.checked_mul(bytes_per_group).context("buffered allocation overflow")?;
             let bytes = wanted.min(target_remaining).min(available);
-            let capacity = bytes / bytes_per_group;
+            let capacity = (bytes / bytes_per_group).min(usize::try_from(u32::MAX).unwrap_or(usize::MAX));
             ensure!(capacity > 0, "not enough free VRAM for one buffered C group");
-            let elements = capacity.checked_mul(rank_count * 128 * 128)
+            let elements_per_group = rank_count.checked_mul(128 * 128)
+                .context("buffered group element count overflow")?;
+            let elements = capacity.checked_mul(elements_per_group)
                 .context("buffered allocation element count overflow")?;
             let stream = self.base.context.default_stream();
             // The GEMM kernel overwrites every element in each submitted batch before hash reads it.
             let buffer = unsafe { stream.alloc::<i32>(elements)? };
             *self.buffered_c.borrow_mut() = Some(buffer);
-            self.buffered_capacity_groups.set(u32::try_from(capacity).unwrap_or(u32::MAX));
+            self.buffered_capacity_groups.set(capacity as u32);
             log::info!(target: "pearl_gpu", "buffered C snapshots: {} groups, {:.2} GiB allocated (VRAM target {:.2} GiB)",
                 capacity, elements as f64 * 4.0 / 1024.0_f64.powi(3),
                 self.vram_budget_bytes as f64 / 1024.0_f64.powi(3));
