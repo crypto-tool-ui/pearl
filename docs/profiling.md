@@ -55,7 +55,7 @@ To isolate a configuration, for example:
 python3 tools/profile_production.py --device 0 --waves 16 --bands 8 --repeats 2 --profile nsys
 ```
 
-The miner accepts `PEARL_SCAN_WAVES=1..128` and `PEARL_SCAN_BAND=1..128` for controlled
+The miner accepts `SCAN_WAVES=1..128` and `SCAN_BAND=1..128` for controlled
 experiments. Unset defaults remain 16 waves, band 4 on T4 or 8 on H100/Blackwell.
 The sweep exports its highest-median setting to `best.env`; it is not applied automatically. Validate any winning setting with a
 sustained mining session and real accepted shares before deploying it broadly.
@@ -103,3 +103,42 @@ for SM120 occupancy and memory limits, which differ from SM100.
 Local tooling checks (no GPU): `python3 tools/test_profile_production.py` exercises
 all 32 default Blackwell sweep runs with a fake benchmark, verifies winner export,
 and checks the raster formula for full and partial bands. It does not measure speed.
+
+## Matrix-size experiment (rebuilt binary required)
+
+Live mining and `--gpu-benchmark` now share `MATRIX_M`, `MATRIX_N`,
+`MATRIX_K`. Defaults remain 131072/131072/4096; rank remains 128 and the
+8x16 proof pattern is unchanged. M/N must be multiples of 128 and at most 2^24;
+K must be a multiple of 128 in 2048..65536. Additional generator/group-index
+limits are checked before allocation. The original verifier permits these shapes;
+pool acceptance must still be checked with real shares.
+
+Build all cubins and the Rust host together: the noise kernel now uses a 64-bit
+cell count and index. Mixing old cubins with the new host is unsupported.
+
+First compare shapes at the same waves/band, on an idle target GPU:
+
+```sh
+python3 tools/profile_production.py --binary ./pearl-miner --waves 16 --bands 8 --repeats 3 --output shape-1g
+python3 tools/profile_production.py --binary ./pearl-miner --matrix-m 262144 --matrix-n 262144 --matrix-k 4096 --waves 16 --bands 8 --repeats 3 --output shape-2g
+python3 tools/profile_production.py --binary ./pearl-miner --matrix-m 262144 --matrix-n 262144 --matrix-k 8192 --waves 16 --bands 8 --repeats 3 --output shape-4g
+python3 tools/profile_production.py --binary ./pearl-miner --matrix-m 262144 --matrix-n 262144 --matrix-k 16384 --waves 16 --bands 8 --repeats 3 --output shape-8g
+```
+
+The GiB names refer only to A+B INT8 storage, not total VRAM. GPU generation/hash
+scratch and noise buffers add memory. CPU proof construction materializes matrices
+and Merkle data, so host RAM and proof latency must also be measured. A faster
+resident scan is not sufficient if proof processing falls behind or shares become stale.
+
+The profile script verifies the actual M/N/K reported by the binary, records the
+shape in `manifest.json`, and includes it in `best.env`. An old binary that ignores
+the requested dimensions is rejected. After comparing summaries, run the Blackwell
+parameter sweep with the selected `--matrix-m/--matrix-n/--matrix-k`, then source
+that run's `best.env` in the shell used to start live mining. The shape flags on the
+profile script explicitly override inherited matrix environment variables.
+
+Local validation: `python3 tools/test_profile_production.py` and
+`python3 tools/test_noise_indexing.py`. The latter exercises the actual noise
+kernel arithmetic with sparse CPU storage at the 4 GiB boundary, not CUDA ABI or
+scheduling. Rust recipe tests cover default compatibility, large deferred shapes
+and invalid dimensions; run `cargo test -p pearl-ref` on an existing Rust host.

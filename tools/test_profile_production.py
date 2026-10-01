@@ -21,10 +21,10 @@ class ProfileTests(unittest.TestCase):
             miner = root / 'miner'
             miner.write_text(f'#!{sys.executable}\n' + '''import json, os
 assert 'STATEAA' not in os.environ
-w = int(os.environ['PEARL_SCAN_WAVES'])
-b = int(os.environ['PEARL_SCAN_BAND'])
+w = int(os.environ['SCAN_WAVES'])
+b = int(os.environ['SCAN_BAND'])
 rate = 350 if (w, b) == (64, 32) else 280
-print('PEARL_BENCHMARK_JSON ' + json.dumps({'tiles': 128, 'th_s': rate}))
+print('PEARL_BENCHMARK_JSON ' + json.dumps({'tiles': 128, 'th_s': rate, 'm': int(os.environ['MATRIX_M']), 'n': int(os.environ['MATRIX_N']), 'k': int(os.environ['MATRIX_K'])}))
 ''')
             miner.chmod(0o755)
             output = root / 'results'
@@ -32,14 +32,17 @@ print('PEARL_BENCHMARK_JSON ' + json.dumps({'tiles': 128, 'th_s': rate}))
             result = subprocess.run([
                 sys.executable, str(ROOT / 'tools/profile_production.py'),
                 '--binary', str(miner), '--preset', 'blackwell', '--output', str(output),
+                '--matrix-m', '262144', '--matrix-n', '262144', '--matrix-k', '16384',
             ], env=env, text=True, capture_output=True, check=True)
             runs = json.loads((output / 'runs.json').read_text())
             self.assertEqual(len(runs), 32)
             self.assertEqual({r['waves'] for r in runs}, {16, 32, 64, 128})
             self.assertEqual({r['band'] for r in runs}, {8, 32, 64, 128})
             exported = (output / 'best.env').read_text()
-            self.assertIn('export PEARL_SCAN_WAVES=64\n', exported)
-            self.assertIn('export PEARL_SCAN_BAND=32\n', exported)
+            self.assertIn('export SCAN_WAVES=64\n', exported)
+            self.assertIn('export SCAN_BAND=32\n', exported)
+            self.assertIn('export MATRIX_K=16384\n', exported)
+            self.assertIn('export MATRIX_M=262144\n', exported)
             self.assertIn('+25.00%', result.stdout)
             self.assertNotIn('STATEAA', exported)
 

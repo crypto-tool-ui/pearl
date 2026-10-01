@@ -257,11 +257,7 @@ fn run_gpu_benchmark(device: usize) -> Result<()> {
     info!(device, "本番サイズのGPUベンチマークを準備しています");
     let preparation = Instant::now();
     let header = test_problem()?.header;
-    let problem = if kernel.device_matrix_preparation() {
-        pearl_ref::Problem::from_kryptex_header_attempt_deferred(header, 0)?
-    } else {
-        pearl_ref::Problem::from_kryptex_header(header)?
-    };
+    let problem = job::configured_problem(header, 0, kernel.device_matrix_preparation())?;
     kernel.prepare_job(&problem)?;
     let prep_seconds = preparation.elapsed().as_secs_f64();
     let (groups, batch) = kernel.mining_groups(&problem)?.context("grouped kernel unavailable")?;

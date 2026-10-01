@@ -174,9 +174,9 @@ extern "C" __global__ void pearl_sm75_uniform(
 }
 
 extern "C" __global__ void pearl_sm75_apply_noise(
-    int8_t* matrix, uint32_t cells, uint32_t k, uint32_t rank,
+    int8_t* matrix, uint64_t cells, uint32_t k, uint32_t rank,
     const int8_t* uniform, const uint32_t* permutation) {
-  const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= cells) return;
   const uint32_t row = index / k;
   const uint32_t col = index % k;

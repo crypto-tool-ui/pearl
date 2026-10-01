@@ -494,8 +494,8 @@ impl ProductionCudaKernel {
             ensure!((1..=max).contains(&value), "{name} must be in 1..={max}");
             Ok(value)
         };
-        let band = setting("PEARL_SCAN_BAND", default_band, 128)?;
-        let waves = setting("PEARL_SCAN_WAVES", 16, 128)?;
+        let band = setting("SCAN_BAND", default_band, 128)?;
+        let waves = setting("SCAN_WAVES", 16, 128)?;
         let groups_per_launch = u32::try_from(
             context.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         )?
@@ -837,7 +837,8 @@ impl MmaSm75CudaKernel {
                        permutation: &[u32],
                        is_b: u32|
          -> Result<CudaSlice<i8>> {
-            let cells = u32::try_from(data.len()).context("T4 matrix exceeds u32 indexing")?;
+            let cells = u64::try_from(data.len()).context("matrix size exceeds u64")?;
+            let noise_grid = u32::try_from(cells.div_ceil(256)).context("noise grid exceeds CUDA width")?;
             let k = u32::try_from(problem.k())?;
             let uniform_len = (data.len() / problem.k())
                 .checked_mul(rank as usize)
@@ -876,7 +877,7 @@ impl MmaSm75CudaKernel {
                 unsafe {
                     result::launch_kernel(
                         noise_kernel.function,
-                        (cells.div_ceil(256), 1, 1),
+                        (noise_grid, 1, 1),
                         (256, 1, 1),
                         0,
                         stream.cu_stream(),

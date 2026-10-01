@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 use zk_pow::api::proof::Hash256;
@@ -121,8 +121,27 @@ impl Problem {
 
     /// Deterministic matrix recipes for device generation; CPU bytes are deferred until proof.
     pub fn from_kryptex_header_attempt_deferred(header: IncompleteBlockHeader, attempt: u64) -> Result<Self> {
+        Self::from_kryptex_header_attempt_shape(header, attempt, KRYPTEX_M, KRYPTEX_N, KRYPTEX_K)
+    }
+
+    /// Configurable dense V3 recipe. Rank and proof patterns remain fixed.
+    /// Returns deferred matrices so large GPU jobs need not allocate host bytes until proof.
+    pub fn from_kryptex_header_attempt_shape(
+        header: IncompleteBlockHeader, attempt: u64, m: u32, n: u32, k: u32,
+    ) -> Result<Self> {
+        ensure!(m > 0 && n > 0 && m <= 1 << 24 && n <= 1 << 24,
+            "M/N must be in 1..=2^24");
+        ensure!(m % 128 == 0 && n % 128 == 0, "production M/N must be multiples of 128");
+        ensure!((2048..=65536).contains(&k) && k % u32::from(KRYPTEX_RANK) == 0,
+            "production K must be 2048..=65536 and divisible by rank 128");
+        let a_len = (m as usize).checked_mul(k as usize).context("A size overflow")?;
+        let b_len = (n as usize).checked_mul(k as usize).context("B size overflow")?;
+        ensure!(a_len as u64 / 8 <= u64::from(u32::MAX)
+            && b_len as u64 / 8 <= u64::from(u32::MAX), "matrix exceeds GPU generator indexing");
+        ensure!(u64::from(m / 128) * u64::from(n / 128) <= u64::from(u32::MAX),
+            "too many production groups");
         let config = MiningConfiguration {
-            common_dim: KRYPTEX_K,
+            common_dim: k,
             rank: KRYPTEX_RANK,
             mma_type: MMAType::Int7xInt7ToInt32,
             rows_pattern: PeriodicPattern::from_list(&KRYPTEX_ROWS)?,
@@ -134,9 +153,9 @@ impl Problem {
         key_material.extend_from_slice(&config.to_bytes());
         let job_key = blake3::hash(&key_material);
         let seed = matrix_attempt_seed(job_key.as_bytes(), attempt);
-        let a = Matrix::generated(seed, KRYPTEX_DOMAIN_A, KRYPTEX_M as usize * KRYPTEX_K as usize);
-        let bt = Matrix::generated(seed, KRYPTEX_DOMAIN_BT, KRYPTEX_N as usize * KRYPTEX_K as usize);
-        Ok(Self { header, config, m: KRYPTEX_M, n: KRYPTEX_N, a, bt,
+        let a = Matrix::generated(seed, KRYPTEX_DOMAIN_A, a_len);
+        let bt = Matrix::generated(seed, KRYPTEX_DOMAIN_BT, b_len);
+        Ok(Self { header, config, m, n, a, bt,
             commitment_cache: Arc::new(OnceLock::new()) })
     }
 
@@ -783,6 +802,29 @@ mod deferred_matrix_tests {
         assert_ne!(first.a.recipe(), next.a.recipe());
         assert_ne!(first.a.recipe(), first.bt.recipe());
     }
+    #[test]
+    fn configurable_shapes_keep_default_recipe_and_defer_large_matrices() {
+        let header = test_problem().unwrap().header;
+        let default = Problem::from_kryptex_header_attempt_deferred(header.clone(), 7).unwrap();
+        let explicit = Problem::from_kryptex_header_attempt_shape(header.clone(), 7,
+            KRYPTEX_M, KRYPTEX_N, KRYPTEX_K).unwrap();
+        assert_eq!(default.job_key(), explicit.job_key());
+        assert_eq!(default.a.recipe(), explicit.a.recipe());
+        assert_eq!(default.bt.recipe(), explicit.bt.recipe());
+        for k in [4096, 8192, 16384] {
+            let p = Problem::from_kryptex_header_attempt_shape(header.clone(), 7, 262144, 262144, k).unwrap();
+            assert_eq!(p.a.len(), 262144usize * k as usize);
+            assert_eq!(p.bt.len(), p.a.len());
+            assert!(!p.a.is_materialized() && !p.bt.is_materialized());
+            assert_eq!(p.config.rank, 128);
+            assert!(p.empty_tile(262080, 262080).is_ok());
+        }
+        for (m, n, k) in [(0, 128, 4096), (129, 128, 4096), (128, 128, 1024),
+            (128, 128, 2112), (128, 128, 65664), (1 << 25, 128, 4096)] {
+            assert!(Problem::from_kryptex_header_attempt_shape(header.clone(), 0, m, n, k).is_err());
+        }
+    }
+
     #[test]
     fn accelerator_roots_cannot_replace_an_existing_commitment() {
         let problem = test_problem().unwrap();

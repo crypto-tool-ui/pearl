@@ -17,8 +17,27 @@ pub fn problem_for_job_mode(job: &PoolJob, attempt: u64, deferred: bool) -> Resu
     let header = IncompleteBlockHeader::from_bytes(&job.header)
         .context("decoding Kryptex IncompleteBlockHeader")?;
     ensure!(header.nbits != 0, "Kryptex job has zero block target");
-    if deferred { Problem::from_kryptex_header_attempt_deferred(header, attempt) }
-    else { Problem::from_kryptex_header_attempt(header, attempt) }
+    configured_problem(header, attempt, deferred)
+}
+
+/// Shared by live mining and the production benchmark; inherited by worker processes.
+pub fn configured_problem(header: IncompleteBlockHeader, attempt: u64, deferred: bool) -> Result<Problem> {
+    let dimension = |name: &str, default: u32| -> Result<u32> {
+        match std::env::var(name) {
+            Ok(value) => value.parse().with_context(|| format!("invalid {name}")),
+            Err(std::env::VarError::NotPresent) => Ok(default),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let problem = Problem::from_kryptex_header_attempt_shape(header, attempt,
+        dimension("MATRIX_M", pearl_ref::KRYPTEX_M)?,
+        dimension("MATRIX_N", pearl_ref::KRYPTEX_N)?,
+        dimension("MATRIX_K", pearl_ref::KRYPTEX_K)?)?;
+    if !deferred {
+        let _ = &*problem.a;
+        let _ = &*problem.bt;
+    }
+    Ok(problem)
 }
 
 #[derive(Default, Debug)]
@@ -71,8 +90,8 @@ pub fn scan_job(
     let grouped = kernel.mining_groups(problem)?;
     let batch_tiles = grouped.map_or(kernel.batch_size(), |(_, groups)| groups as usize * 128);
     debug!(
-        "マイニング開始 | ジョブ={} | 総タイル数={} | バッチ={}",
-        job.job_id, total, batch_tiles
+        "マイニング開始 | ジョブ={} | 総タイル数={} | バッチ={} | M={} N={} K={} rank={}",
+        job.job_id, total, batch_tiles, problem.m, problem.n, problem.k(), problem.config.rank
     );
     debug!("シェア難易度 | ジョブ={} | プール目標={:064x} | GPU目標={:064x} | 平均必要タイル={:.0}",
         job.job_id, job.target, bound, mean_tiles_per_share);
