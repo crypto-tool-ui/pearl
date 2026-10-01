@@ -494,13 +494,13 @@ impl ProductionCudaKernel {
             ensure!((1..=max).contains(&value), "{name} must be in 1..={max}");
             Ok(value)
         };
-        let band = setting("PEARL_SCAN_BAND", default_band, 32)?;
-        let waves = setting("PEARL_SCAN_WAVES", 16, 64)?;
+        let band = setting("PEARL_SCAN_BAND", default_band, 128)?;
+        let waves = setting("PEARL_SCAN_WAVES", 16, 128)?;
         let groups_per_launch = u32::try_from(
             context.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         )?
         .saturating_mul(waves)
-        .clamp(32, 16384);
+        .clamp(32, 32768);
         let scan = load_cuda_kernel(&context, cubin, "pearl_production_scan")?;
         let stream = context.default_stream();
         let scratch = RefCell::new(ScanScratch {

@@ -35,13 +35,16 @@ def main():
     parser.add_argument('--binary', type=Path, default=Path(__file__).resolve().parent.parent / 'pearl-miner')
     parser.add_argument('--device', type=int, default=0, help='CUDA ordinal as seen by miner')
     parser.add_argument('--repeats', type=int, default=2)
-    parser.add_argument('--waves', nargs='+', type=int, default=[4, 16, 64])
-    parser.add_argument('--bands', nargs='+', type=int, default=[4, 8, 16])
+    parser.add_argument('--preset', choices=['default', 'blackwell'], default='default')
+    parser.add_argument('--waves', nargs='+', type=int)
+    parser.add_argument('--bands', nargs='+', type=int)
     parser.add_argument('--profile', choices=['none', 'nsys', 'ncu', 'all'], default='none')
     parser.add_argument('--output', type=Path, default=Path('pearl-profile-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')))
     args = parser.parse_args()
-    if args.repeats < 1 or args.device < 0 or any(not 1 <= x <= 64 for x in args.waves) or any(not 1 <= x <= 32 for x in args.bands):
-        parser.error('repeats >= 1, device >= 0, waves 1..64, bands 1..32 required')
+    args.waves = args.waves or ([16, 32, 64, 128] if args.preset == 'blackwell' else [4, 16, 64])
+    args.bands = args.bands or ([8, 32, 64, 128] if args.preset == 'blackwell' else [4, 8, 16])
+    if args.repeats < 1 or args.device < 0 or any(not 1 <= x <= 128 for x in args.waves) or any(not 1 <= x <= 128 for x in args.bands):
+        parser.error('repeats >= 1, device >= 0, waves 1..128, bands 1..128 required')
     binary = args.binary.resolve()
     if not binary.is_file():
         parser.error(f'miner not found: {binary}; pass --binary /path/to/pearl-miner')
@@ -50,7 +53,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / 'manifest.json').write_text(json.dumps({
         'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
-        'device': args.device, 'waves': args.waves, 'bands': args.bands,
+        'device': args.device, 'preset': args.preset, 'waves': args.waves, 'bands': args.bands,
         'repeats': args.repeats, 'profile': args.profile,
         'started_utc': datetime.now(timezone.utc).isoformat()
     }, indent=2) + '\n')
@@ -93,6 +96,15 @@ def main():
     summary.sort(key=lambda r: r['median_th_s'], reverse=True)
     (args.output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     best = summary[0]
+    # Only numeric, validated parameters enter this shell file. Never include credentials.
+    (args.output / 'best.env').write_text(
+        '# Highest median resident scan in this sweep; validate during live mining.\n'
+        f'export PEARL_SCAN_WAVES={best["waves"]}\n'
+        f'export PEARL_SCAN_BAND={best["band"]}\n')
+    baseline = next((r for r in summary if r['waves'] == 16 and r['band'] == 8), None)
+    if baseline:
+        gain = 100 * (best['median_th_s'] / baseline['median_th_s'] - 1)
+        print(f'Compared with waves=16 band=8: {gain:+.2f}% median resident scan', flush=True)
     print('Fastest observed resident scan (not live mining): ' + json.dumps(best), flush=True)
     child_env = dict(env, PEARL_SCAN_WAVES=str(best['waves']), PEARL_SCAN_BAND=str(best['band']))
     command = [str(binary), '--gpu-benchmark', '--device', str(args.device)]
