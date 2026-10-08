@@ -5,6 +5,7 @@
 
 use std::{
     ffi::{c_void, CString},
+    process::Command,
     sync::Arc,
 };
 
@@ -63,6 +64,127 @@ pub struct KernelMetadata {
     pub architecture: KernelArchitecture,
     pub precision: KernelPrecision,
     pub certificate_version: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuInfo {
+    pub name: String,
+    pub compute_capability: (i32, i32),
+    pub multiprocessors: u32,
+    pub uuid: String,
+    pub driver_version: String,
+    pub toolkit_version: String,
+    pub total_memory_bytes: u64,
+    pub free_memory_bytes: u64,
+    pub memory_bus_width_bits: Option<u32>,
+    pub graphics_clock_mhz: Option<u32>,
+    pub memory_clock_mhz: Option<u32>,
+    pub power_watts: Option<f64>,
+    pub temperature_c: Option<u32>,
+    pub utilization_gpu_percent: Option<u32>,
+    pub utilization_memory_percent: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuArchitecture { TuringSm75, HopperSm90, BlackwellSm120, Generic }
+
+pub fn kernel_source_hash() -> &'static str {
+    option_env!("PEARL_KERNEL_SOURCE_HASH").unwrap_or("unknown")
+}
+
+pub fn architecture_for_capability(capability: (i32, i32)) -> GpuArchitecture {
+    match capability {
+        (7, 5) => GpuArchitecture::TuringSm75,
+        (9, 0) => GpuArchitecture::HopperSm90,
+        (12, 0) => GpuArchitecture::BlackwellSm120,
+        _ => GpuArchitecture::Generic,
+    }
+}
+
+pub fn inspect_gpu(device_ordinal: usize) -> Result<GpuInfo> {
+    let context = CudaContext::new(device_ordinal)
+        .with_context(|| format!("opening CUDA device {device_ordinal}"))?;
+    let name = context.name().context("querying CUDA device name")?;
+    let compute_capability = context.compute_capability().context("querying CUDA compute capability")?;
+    let multiprocessors = u32::try_from(context.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)?;
+    let (free_bytes, total_bytes) = context.mem_get_info().context("querying CUDA memory")?;
+    let memory_bus_width_bits = context.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)
+        .ok().and_then(|width| u32::try_from(width).ok());
+    let device_id = device_ordinal.to_string();
+    let telemetry = Command::new("nvidia-smi")
+        .args(["--id", device_id.as_str(), "--query-gpu=uuid,driver_version,clocks.gr,clocks.mem,power.draw,temperature.gpu,memory.total,memory.free,utilization.gpu,utilization.memory", "--format=csv,noheader,nounits"])
+        .output().ok().filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|row| parse_nvidia_smi(&row));
+    let toolkit_version = option_env!("PEARL_CUDA_TOOLKIT_VERSION").unwrap_or("unknown").to_owned();
+    Ok(GpuInfo {
+        name,
+        compute_capability,
+        multiprocessors,
+        uuid: telemetry.as_ref().map(|v| v.uuid.clone()).unwrap_or_else(|| format!("ordinal-{device_ordinal}")),
+        driver_version: telemetry.as_ref().map(|v| v.driver.clone()).unwrap_or_else(|| "unknown".into()),
+        toolkit_version,
+        total_memory_bytes: telemetry.as_ref().and_then(|v| v.total_mib).map(|mib| mib * 1024 * 1024).unwrap_or(total_bytes as u64),
+        free_memory_bytes: telemetry.as_ref().and_then(|v| v.free_mib).map(|mib| mib * 1024 * 1024).unwrap_or(free_bytes as u64),
+        memory_bus_width_bits,
+        graphics_clock_mhz: telemetry.as_ref().and_then(|v| v.graphics_clock_mhz),
+        memory_clock_mhz: telemetry.as_ref().and_then(|v| v.memory_clock_mhz),
+        power_watts: telemetry.as_ref().and_then(|v| v.power_watts),
+        temperature_c: telemetry.as_ref().and_then(|v| v.temperature_c),
+        utilization_gpu_percent: telemetry.as_ref().and_then(|v| v.utilization_gpu_percent),
+        utilization_memory_percent: telemetry.as_ref().and_then(|v| v.utilization_memory_percent),
+    })
+}
+
+struct NvmlRow {
+    uuid: String,
+    driver: String,
+    graphics_clock_mhz: Option<u32>,
+    memory_clock_mhz: Option<u32>,
+    power_watts: Option<f64>,
+    temperature_c: Option<u32>,
+    total_mib: Option<u64>,
+    free_mib: Option<u64>,
+    utilization_gpu_percent: Option<u32>,
+    utilization_memory_percent: Option<u32>,
+}
+
+fn parse_nvidia_smi(row: &str) -> Option<NvmlRow> {
+    let values: Vec<_> = row.lines().next()?.split(',').map(str::trim).collect();
+    if values.len() != 10 { return None; }
+    let number = |index: usize| values[index].parse::<u32>().ok();
+    Some(NvmlRow {
+        uuid: values[0].to_owned(), driver: values[1].to_owned(),
+        graphics_clock_mhz: number(2), memory_clock_mhz: number(3),
+        power_watts: values[4].parse().ok(), temperature_c: number(5),
+        total_mib: values[6].parse().ok(), free_mib: values[7].parse().ok(),
+        utilization_gpu_percent: number(8), utilization_memory_percent: number(9),
+    })
+}
+
+#[cfg(test)]
+mod gpu_info_tests {
+    use super::*;
+
+    #[test]
+    fn compute_capability_is_the_architecture_selector() {
+        assert_eq!(architecture_for_capability((7, 5)), GpuArchitecture::TuringSm75);
+        assert_eq!(architecture_for_capability((9, 0)), GpuArchitecture::HopperSm90);
+        assert_eq!(architecture_for_capability((12, 0)), GpuArchitecture::BlackwellSm120);
+        assert_eq!(architecture_for_capability((8, 9)), GpuArchitecture::Generic);
+    }
+
+    #[test]
+    fn nvidia_smi_telemetry_is_parsed_with_optional_fields() {
+        let gpu = parse_nvidia_smi("GPU-deadbeef, 550.54, 1200, 5000, 180.5, 65, 49140, 47000, 99, 80\n").unwrap();
+        assert_eq!(gpu.uuid, "GPU-deadbeef");
+        assert_eq!(gpu.driver, "550.54");
+        assert_eq!(gpu.temperature_c, Some(65));
+        assert_eq!(gpu.total_mib, Some(49140));
+        let missing = parse_nvidia_smi("GPU-a, 550, N/A, 5000, N/A, N/A, N/A, 0, N/A, N/A\n").unwrap();
+        assert_eq!(missing.graphics_clock_mhz, None);
+        assert_eq!(missing.power_watts, None);
+    }
 }
 
 /// Common interface for per-architecture, per-precision GEMM implementations.

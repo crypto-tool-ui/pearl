@@ -36,6 +36,7 @@ use tracing::{debug, error, info, warn};
 mod job;
 mod logging;
 mod prefetch;
+mod tuning;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct FileConfig {
@@ -124,6 +125,20 @@ struct Cli {
     streams: usize,
     groups_per_launch: Option<u32>,
     gpu_benchmark_seconds: u64,
+    tune: bool,
+    tune_fast: bool,
+    retune: bool,
+    no_tune: bool,
+    show_tuning: bool,
+    clear_tuning: bool,
+    tune_duration: u64,
+    tune_warmup: u64,
+    tune_stability: u64,
+    tune_max_temperature_c: u32,
+    tune_target: Option<usize>,
+    tune_probe: bool,
+    tune_probe_stable: bool,
+    tune_cutoff_ths: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -162,7 +177,7 @@ fn default_device() -> usize {
 }
 
 fn usage() -> &'static str {
-    "pearl-miner [OPTIONS]\n\n  STATEAA=hex(endpoint|wallet|worker|log[|password])\n  log: 1 = console on, 0 = console off; password defaults to x\n\n  --config PATH             Read optional device/metrics config\n  --benchmark               Run the offline CPU benchmark\n  --gpu-benchmark           Self-test and benchmark resident production GPU mining\n  --gpu-benchmark-seconds N Set GPU benchmark duration (default 30)\n  --selftest                Verify golden tiles and batches on the selected GPU\n  --gpu-worker              Internal disposable GPU child process\n  --device N                Override the CUDA device ordinal\n  --mem-mode MODE           Scan mode: fused (default), buffered, pipelined\n  --vram-budget-gb N        VRAM target for buffered mode (default 12.46)\n  --streams N               Pipeline depth (2..8, default 3)\n  --groups-per-launch N     Override groups per launch\n  --metrics-listen ADDR     Expose Prometheus text metrics\n  --power-limit-watts N     Apply nvidia-smi power limit\n  --graphics-clock-mhz N    Apply locked graphics clock\n  --memory-clock-mhz N     Apply locked memory clock\n  -h, --help                Show this help"
+    "pearl-miner [OPTIONS]\n\n  STATEAA=hex(endpoint|wallet|worker|log[|password])\n  log: 1 = console on, 0 = console off; password defaults to x\n\n  --config PATH             Read optional device/metrics config\n  --benchmark               Run the offline CPU benchmark\n  --gpu-benchmark           Self-test and benchmark resident production GPU mining\n  --gpu-benchmark-seconds N Set GPU benchmark duration (default 30)\n  --selftest                Verify golden tiles and batches on the selected GPU\n  --gpu-worker              Internal disposable GPU child process\n  --device N                Override the CUDA device ordinal\n  --mem-mode MODE           Scan mode: fused (default), buffered, pipelined\n  --vram-budget-gb N        VRAM target for buffered mode (default 12.46)\n  --streams N               Pipeline depth (2..8, default 3)\n  --groups-per-launch N     Override groups per launch\n  --metrics-listen ADDR     Expose Prometheus text metrics\n  --power-limit-watts N     Apply nvidia-smi power limit\n  --graphics-clock-mhz N    Apply locked graphics clock\n  --memory-clock-mhz N      Apply locked memory clock\n  --tune                    Tune and cache the selected GPU\n  --tune-fast               Short tuning run for development\n  --retune                  Ignore cache and tune again\n  --no-tune                 Disable profile loading and tuning\n  --show-tuning             Print the selected GPU profile\n  --clear-tuning            Remove the selected GPU profile\n  --tune-duration SECONDS   Candidate measurement time (default 20)\n  --tune-warmup SECONDS     Candidate warmup time (default 8)\n  --tune-stability SECONDS  Final stability time (default 120)\n  -h, --help                Show this help"
 }
 
 fn parse_cli() -> Result<Cli> {
@@ -171,6 +186,10 @@ fn parse_cli() -> Result<Cli> {
         vram_budget_gb: 12.46,
         streams: 3,
         gpu_benchmark_seconds: 30,
+        tune_duration: 20,
+        tune_warmup: 8,
+        tune_stability: 120,
+        tune_max_temperature_c: 85,
         ..Cli::default()
     };
     let mut args = env::args().skip(1);
@@ -182,6 +201,20 @@ fn parse_cli() -> Result<Cli> {
             "--config" => cli.config = PathBuf::from(value("--config", &mut args)?),
             "--benchmark" => cli.benchmark = true,
             "--gpu-benchmark" => cli.gpu_benchmark = true,
+            "--tune" => cli.tune = true,
+            "--tune-fast" => cli.tune_fast = true,
+            "--retune" => cli.retune = true,
+            "--no-tune" => cli.no_tune = true,
+            "--show-tuning" => cli.show_tuning = true,
+            "--clear-tuning" => cli.clear_tuning = true,
+            "--tune-duration" => cli.tune_duration = value("--tune-duration", &mut args)?.parse().context("invalid --tune-duration")?,
+            "--tune-warmup" => cli.tune_warmup = value("--tune-warmup", &mut args)?.parse().context("invalid --tune-warmup")?,
+            "--tune-stability" => cli.tune_stability = value("--tune-stability", &mut args)?.parse().context("invalid --tune-stability")?,
+            "--tune-max-temp-c" => cli.tune_max_temperature_c = value("--tune-max-temp-c", &mut args)?.parse().context("invalid --tune-max-temp-c")?,
+            "--tune-target" => cli.tune_target = Some(value("--tune-target", &mut args)?.parse().context("invalid --tune-target")?),
+            "--tune-probe" => cli.tune_probe = true,
+            "--tune-probe-stable" => cli.tune_probe_stable = true,
+            "--tune-cutoff-ths" => cli.tune_cutoff_ths = Some(value("--tune-cutoff-ths", &mut args)?.parse().context("invalid --tune-cutoff-ths")?),
             "--selftest" => cli.selftest = true,
             "--gpu-worker" => cli.gpu_worker = true,
             "--mem-mode" => cli.mem_mode = value("--mem-mode", &mut args)?.parse()?,
@@ -195,16 +228,22 @@ fn parse_cli() -> Result<Cli> {
             "--graphics-clock-mhz" => cli.graphics_clock_mhz = Some(value("--graphics-clock-mhz", &mut args)?.parse().context("invalid graphics clock")?),
             "--memory-clock-mhz" => cli.memory_clock_mhz = Some(value("--memory-clock-mhz", &mut args)?.parse().context("invalid memory clock")?),
             "-h" | "--help" => {
-                println!("{}", usage());
+                println!("{}\n  --tune-target N           Tune and run only this GPU ordinal\n  --tune-max-temp-c N       Reject tuning above this temperature (default 85)", usage());
                 process::exit(0);
             }
             other => bail!("unknown option {other}\n\n{}", usage()),
         }
     }
     ensure!(cli.vram_budget_gb.is_finite() && cli.vram_budget_gb >= 1.0, "--vram-budget-gb must be finite and at least 1 GiB");
-    ensure!((2..=8).contains(&cli.streams), "--streams must be in 2..=8");
+    ensure!((1..=8).contains(&cli.streams), "--streams must be in 1..=8");
+    ensure!(cli.mem_mode != MemMode::Pipelined || cli.streams >= 2, "pipelined mode requires at least 2 streams");
     ensure!(cli.groups_per_launch.map_or(true, |n| n > 0), "--groups-per-launch must be positive");
     ensure!((1..=3600).contains(&cli.gpu_benchmark_seconds), "--gpu-benchmark-seconds must be in 1..=3600");
+    ensure!((1..=3600).contains(&cli.tune_duration), "--tune-duration must be in 1..=3600");
+    ensure!((0..=3600).contains(&cli.tune_warmup), "--tune-warmup must be in 0..=3600");
+    ensure!((1..=1800).contains(&cli.tune_stability), "--tune-stability must be in 1..=1800");
+    ensure!((50..=110).contains(&cli.tune_max_temperature_c), "--tune-max-temp-c must be in 50..=110");
+    ensure!(!(cli.no_tune && (cli.tune || cli.tune_fast || cli.retune)), "--no-tune conflicts with tuning options");
     Ok(cli)
 }
 
@@ -220,6 +259,22 @@ fn selected_device(cli: &Cli, config: &FileConfig) -> usize {
     cli.device
         .or_else(|| config.mining.as_ref().map(|value| value.device))
         .unwrap_or_else(default_device)
+}
+
+fn selected_devices(cli: &Cli, config: &FileConfig) -> Vec<usize> {
+    if cli.device.is_some() {
+        return vec![selected_device(cli, config)];
+    }
+    if let Some(devices) = config.mining.as_ref().map(|value| &value.devices) {
+        if !devices.is_empty() {
+            let mut unique = Vec::new();
+            for &device in devices {
+                if !unique.contains(&device) { unique.push(device); }
+            }
+            return unique;
+        }
+    }
+    vec![selected_device(cli, config)]
 }
 
 fn validate_certificate_version(version: u32) -> Result<()> {
@@ -383,8 +438,61 @@ fn init_tracing(enabled: bool) -> Result<()> {
 }
 
 async fn run_daemon(cli: Cli, config: FileConfig) -> Result<()> {
-    let device = selected_device(&cli, &config);
-    apply_clock_options(&config, &cli, device)?;
+    let devices = selected_devices(&cli, &config);
+    ensure!(!devices.is_empty(), "no mining GPUs selected");
+    let executable = env::current_exe().context("locating miner executable")?;
+    let mut workers = Vec::with_capacity(devices.len());
+    for device in devices {
+        let mut worker_cli = cli.clone();
+        worker_cli.device = Some(device);
+        apply_clock_options(&config, &worker_cli, device)?;
+        if !worker_cli.no_tune {
+            let params = match tuning::apply(device, tuning::Settings {
+                warmup_seconds: worker_cli.tune_warmup,
+                measure_seconds: worker_cli.tune_duration,
+                stability_seconds: worker_cli.tune_stability,
+                max_temperature_c: worker_cli.tune_max_temperature_c,
+            }, false) {
+                Ok(params) => Some(params),
+                Err(error) => {
+                    warn!(device, error = %error, "GPU tuning failed; using configured settings");
+                    None
+                }
+            };
+            if let Some(params) = params {
+                worker_cli.groups_per_launch = Some(params.groups_per_launch);
+                worker_cli.mem_mode = params.mem_mode.parse()?;
+                worker_cli.streams = params.streams as usize;
+            }
+        }
+        workers.push((device, worker_cli));
+    }
+    let mut children = Vec::with_capacity(workers.len());
+    for (device, worker_cli) in workers {
+        env::set_var("PEARL_MEM_MODE", worker_cli.mem_mode.as_str());
+        env::set_var("PEARL_STREAMS", worker_cli.streams.to_string());
+        if let Some(groups) = worker_cli.groups_per_launch {
+            env::set_var("PEARL_GROUPS_PER_LAUNCH", groups.to_string());
+        } else {
+            env::remove_var("PEARL_GROUPS_PER_LAUNCH");
+        }
+        let mut child_command = Command::new(&executable);
+        child_command.args(["--gpu-worker", "--config"]).arg(&cli.config)
+            .arg("--device").arg(device.to_string())
+            .arg("--mem-mode").arg(worker_cli.mem_mode.as_str())
+            .arg("--vram-budget-gb").arg(worker_cli.vram_budget_gb.to_string())
+            .arg("--streams").arg(worker_cli.streams.to_string());
+        if let Some(groups) = worker_cli.groups_per_launch {
+            child_command.arg("--groups-per-launch").arg(groups.to_string());
+        }
+        match child_command.spawn() {
+            Ok(child) => children.push((device, child)),
+            Err(error) => {
+                for (_, child) in &mut children { let _ = child.kill(); let _ = child.wait(); }
+                return Err(error).with_context(|| format!("starting GPU {device} worker"));
+            }
+        }
+    }
     let (stop_tx, stop_rx) = watch::channel(false);
     let metrics = cli.metrics_listen.clone().or_else(|| config.metrics.as_ref().and_then(|x| x.listen.clone()));
     let metrics_task = if let Some(address) = metrics {
@@ -393,34 +501,33 @@ async fn run_daemon(cli: Cli, config: FileConfig) -> Result<()> {
     } else {
         None
     };
-
-    let executable = env::current_exe().context("locating miner executable")?;
-    let mut child_command = Command::new(executable);
-    child_command
-        .arg("--gpu-worker")
-        .arg("--config")
-        .arg(&cli.config)
-        .arg("--device")
-        .arg(device.to_string());
-    child_command
-        .arg("--mem-mode").arg(cli.mem_mode.as_str())
-        .arg("--vram-budget-gb").arg(cli.vram_budget_gb.to_string())
-        .arg("--streams").arg(cli.streams.to_string());
-    if let Some(groups) = cli.groups_per_launch {
-        child_command.arg("--groups-per-launch").arg(groups.to_string());
-    }
-    let mut child = child_command
-        .spawn()
-        .context("starting disposable GPU worker")?;
-    let status = child.wait().context("waiting for GPU worker")?;
-    if !status.success() {
-        warn!(code = ?status.code(), "GPUワーカーが停止したため、マイニングを停止します");
+    let mut completed = vec![false; children.len()];
+    loop {
+        let mut pending = false;
+        let mut failure = None;
+        for (index, (device, child)) in children.iter_mut().enumerate() {
+            if completed[index] { continue; }
+            match child.try_wait().with_context(|| format!("checking GPU {device} worker"))? {
+                Some(status) if status.success() => completed[index] = true,
+                Some(status) => { failure = Some((*device, status)); break; }
+                None => pending = true,
+            }
+        }
+        if let Some((device, status)) = failure {
+            for (index, (_, child)) in children.iter_mut().enumerate() {
+                if !completed[index] { let _ = child.kill(); let _ = child.wait(); }
+            }
+            let _ = stop_tx.send(true);
+            if let Some(task) = metrics_task { let _ = task.await; }
+            anyhow::bail!("GPU {device} worker exited with {status}");
+        }
+        if !pending { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     let _ = stop_tx.send(true);
     if let Some(task) = metrics_task {
         let _ = task.await;
     }
-    ensure!(status.success(), "GPU worker exited with {status}");
     Ok(())
 }
 
@@ -718,7 +825,10 @@ fn gpu_loop(
 }
 
 async fn async_main() -> Result<()> {
-    let cli = parse_cli()?;
+    let mut cli = parse_cli()?;
+    if cli.tune_target.is_some() {
+        cli.device = cli.tune_target;
+    }
     env::set_var("PEARL_MEM_MODE", cli.mem_mode.as_str());
     env::set_var("PEARL_VRAM_BUDGET_GB", cli.vram_budget_gb.to_string());
     env::set_var("PEARL_STREAMS", cli.streams.to_string());
@@ -731,6 +841,12 @@ async fn async_main() -> Result<()> {
         return run_benchmark();
     }
     let device = selected_device(&cli, &config);
+    if cli.show_tuning {
+        return tuning::show(device);
+    }
+    if cli.clear_tuning {
+        return tuning::clear(device);
+    }
     if cli.gpu_benchmark {
         init_tracing(true)?;
         return run_gpu_benchmark(device, cli.gpu_benchmark_seconds);
@@ -739,11 +855,42 @@ async fn async_main() -> Result<()> {
         init_tracing(true)?;
         return run_selftest(device);
     }
-    let stateaa = StateaaConfig::from_env()?;
-    init_tracing(stateaa.log_enabled)?;
+    if cli.tune_probe {
+        let parameters = tuning::Parameters {
+            groups_per_launch: cli.groups_per_launch.context("--tune-probe requires groups per launch")?,
+            mem_mode: cli.mem_mode.as_str().into(),
+            streams: cli.streams as u32,
+        };
+        let result = tuning::probe(device, &parameters, tuning::Settings {
+            warmup_seconds: cli.tune_warmup,
+            measure_seconds: cli.tune_duration,
+            stability_seconds: cli.tune_stability,
+            max_temperature_c: cli.tune_max_temperature_c,
+        }, cli.tune_probe_stable, cli.tune_cutoff_ths.map(|v| v * 1e12))?;
+        println!("PEARL_TUNE_PROBE {}", serde_json::to_string(&result)?);
+        return Ok(());
+    }
     if cli.gpu_worker {
+        let stateaa = StateaaConfig::from_env()?;
+        init_tracing(stateaa.log_enabled)?;
         return run_gpu_worker(cli, config, stateaa).await;
     }
+    let explicit_tuning = cli.tune || cli.tune_fast || cli.retune;
+    if explicit_tuning {
+        let fast = cli.tune_fast;
+        let settings = tuning::Settings {
+            warmup_seconds: if fast { 1 } else { cli.tune_warmup },
+            measure_seconds: if fast { 3 } else { cli.tune_duration },
+            stability_seconds: if fast { 10 } else { cli.tune_stability },
+            max_temperature_c: cli.tune_max_temperature_c,
+        };
+        for target in selected_devices(&cli, &config) {
+            tuning::apply(target, settings, true)?;
+        }
+        return Ok(());
+    }
+    let stateaa = StateaaConfig::from_env()?;
+    init_tracing(stateaa.log_enabled)?;
     run_daemon(cli, config).await
 }
 
@@ -781,5 +928,16 @@ mod tests {
             assert!(!StateaaConfig::decode(&hex::encode(format!("localhost:9000|wallet|worker|{flag}"))).unwrap().log_enabled);
         }
         assert!(StateaaConfig::decode(&hex::encode("localhost:9000|wallet|worker|/tmp/miner.log")).is_err());
+    }
+
+    #[test]
+    fn configured_gpus_are_tuned_independently_and_cli_device_overrides_the_list() {
+        let config = FileConfig {
+            mining: Some(MiningConfig { device: 0, devices: vec![2, 1, 2] }),
+            ..FileConfig::default()
+        };
+        assert_eq!(selected_devices(&Cli::default(), &config), vec![2, 1]);
+        let cli = Cli { device: Some(3), ..Cli::default() };
+        assert_eq!(selected_devices(&cli, &config), vec![3]);
     }
 }

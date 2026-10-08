@@ -4,6 +4,8 @@
 
 [mining]
 device = 0
+# Optional: run one independent worker and tuning profile per listed GPU.
+# devices = [0, 1]
 
 [metrics]
 # listen = "127.0.0.1:9835"

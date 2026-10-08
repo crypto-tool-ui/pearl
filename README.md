@@ -57,6 +57,36 @@ launch and result-count readback but excludes setup and CPU proofs (setup is pri
 The daemon uses a disposable `--gpu-worker` child so a
 driver failure stops mining without allowing an unverified share to reach the network.
 
+## Auto tuning
+
+The first normal miner start benchmarks each configured GPU's production scan, then caches the
+best stable launch batch and supported scan mode under `~/.pearl-miner/tuning/`. Later starts
+verify that profile briefly and retune if measured throughput falls by more than 15%. Profiles
+are keyed by GPU UUID, name, ordinal, compute capability, driver/toolkit versions, and miner
+kernel version; each configured GPU has an independent profile. The search uses coarse,
+focused, fine, and sustained stability stages. SM75, SM90, and SM120 use separate candidate
+spaces. Candidate runs are isolated in disposable miner processes, so CUDA faults and hangs do
+not take down the mining worker.
+
+```sh
+./target/release/pearl-miner --tune
+./target/release/pearl-miner --tune-fast
+./target/release/pearl-miner --retune
+./target/release/pearl-miner --show-tuning --device 0
+./target/release/pearl-miner --clear-tuning --device 0
+./target/release/pearl-miner --no-tune
+./target/release/pearl-miner --tune-target 1
+```
+
+Set `devices = [0, 1]` under `[mining]` in `config.toml` to tune and mine each GPU with its
+own worker and profile; `--device N` selects one device for a single-GPU run.
+
+Tuning increases first-start time. `--tune-fast` is for development; regular tuning defaults
+to 8 seconds warmup, 20 seconds per candidate, and a 120 second stability run. Use
+`--tune-warmup`, `--tune-duration`, `--tune-stability`, and `--tune-max-temp-c` to adjust the
+measurement policy. Share correctness remains guarded by the miner's CPU verification before
+submission.
+
 ## Run from environment
 
 ```sh

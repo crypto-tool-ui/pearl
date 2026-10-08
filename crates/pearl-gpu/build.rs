@@ -1,7 +1,15 @@
-use std::{env, path::PathBuf, process::Command};
+use std::{
+    collections::hash_map::DefaultHasher,
+    env,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(pearl_cuda_built)");
+    let kernel_hash = hash_cuda_sources(Path::new("../../cuda"));
+    println!("cargo:rustc-env=PEARL_KERNEL_SOURCE_HASH={kernel_hash}");
     println!("cargo:rerun-if-changed=../../cuda/naive.cu");
     println!("cargo:rerun-if-changed=../../cuda/sm75_mma.cu");
     println!("cargo:rerun-if-changed=../../cuda/production.cu");
@@ -16,8 +24,17 @@ fn main() {
 
     let Some(nvcc) = find_nvcc() else {
         println!("cargo:warning=nvcc was not found; CUDA cubins are skipped");
+        println!("cargo:rustc-env=PEARL_CUDA_TOOLKIT_VERSION=unknown");
         return;
     };
+
+    let toolkit = Command::new(&nvcc).arg("--version").output()
+        .ok().filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| output.lines().find_map(|line| line.split("release ").nth(1).map(str::to_owned)))
+        .and_then(|version| version.split(',').next().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rustc-env=PEARL_CUDA_TOOLKIT_VERSION={toolkit}");
 
     println!("cargo:rustc-cfg=pearl_cuda_built");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
@@ -136,6 +153,30 @@ fn main() {
         }
         println!("cargo:rustc-env={env_name}={}", output.display());
     }
+}
+
+fn hash_cuda_sources(root: &Path) -> String {
+    fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, files);
+            } else if matches!(path.extension().and_then(|ext| ext.to_str()), Some("cu" | "cuh" | "h" | "hpp")) {
+                println!("cargo:rerun-if-changed={}", path.display());
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    collect(root, &mut files);
+    files.sort();
+    let mut hasher = DefaultHasher::new();
+    for path in files {
+        path.hash(&mut hasher);
+        std::fs::read(path).unwrap_or_default().hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 fn find_nvcc() -> Option<PathBuf> {
