@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{ensure, Context, Result};
-use pearl_gpu::{inspect_gpu, select_production_kernel, GemmKernel, GpuInfo};
+use pearl_gpu::{inspect_gpu, select_production_kernel, GpuInfo};
 use pearl_ref::test_problem;
 use serde::{Deserialize, Serialize};
 
@@ -125,8 +125,8 @@ fn candidate_score(rate: f64, variance: f64) -> Option<f64> {
         .then_some(rate / (1.0 + variance.sqrt()))
 }
 
-fn save(info: &GpuInfo, ordinal: usize, profile: &Profile) -> Result<()> {
-    let file = path(info, ordinal)?;
+fn save(info: &GpuInfo, profile: &Profile) -> Result<()> {
+    let file = path(info)?;
     write_profile(&file, profile)
 }
 
@@ -407,7 +407,7 @@ pub fn apply(device: usize, settings: Settings, force: bool) -> Result<Parameter
         utilization_gpu_percent: stable.utilization_gpu_percent,
         utilization_memory_percent: stable.utilization_memory_percent,
     };
-    save(&info, device, &profile)?;
+    save(&info, &profile)?;
     println!("[TUNE] Best stable rate {:.3} TH/s; profile saved", stable.rate / 1e12);
     Ok(parameters)
 }
