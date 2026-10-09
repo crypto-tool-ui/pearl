@@ -365,7 +365,6 @@ pub fn apply(device: usize, settings: Settings, force: bool) -> Result<Parameter
             }, false, None) {
                 Ok(check) if check.rate >= profile.hashrate * 0.85 => {
                     println!("[TUNE] Cache valid: {:.3} TH/s", check.rate / 1e12);
-                    set_parameters(&profile.parameters);
                     return Ok(profile.parameters);
                 }
                 Ok(check) => println!("[TUNE] Cache degraded: {:.3} TH/s vs {:.3} TH/s; retuning", check.rate / 1e12, profile.hashrate / 1e12),
@@ -409,7 +408,6 @@ pub fn apply(device: usize, settings: Settings, force: bool) -> Result<Parameter
         utilization_memory_percent: stable.utilization_memory_percent,
     };
     save(&info, device, &profile)?;
-    set_parameters(&parameters);
     println!("[TUNE] Best stable rate {:.3} TH/s; profile saved", stable.rate / 1e12);
     Ok(parameters)
 }

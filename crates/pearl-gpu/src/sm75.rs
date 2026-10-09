@@ -552,10 +552,9 @@ impl ProductionCudaKernel {
             Some(load_cuda_kernel(&context, cubin, "pearl_production_hash_buffered")?)
         } else { None };
         let stream_count = if mem_mode == ScanMemMode::Pipelined {
-            setting("PEARL_STREAMS", 3, 8)? as usize
+            // A stale inherited value of 1 must not make the GPU worker exit.
+            setting("PEARL_STREAMS", 3, 8)?.max(2) as usize
         } else { 1 };
-        ensure!(mem_mode != ScanMemMode::Pipelined || stream_count >= 2,
-            "PEARL_STREAMS must be in 2..=8 for pipelined mode");
         let streams = if mem_mode == ScanMemMode::Pipelined {
             (0..stream_count).map(|_| context.new_stream()).collect::<std::result::Result<Vec<_>, _>>()?
         } else {

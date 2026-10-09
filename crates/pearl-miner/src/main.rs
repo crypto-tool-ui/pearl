@@ -469,21 +469,21 @@ async fn run_daemon(cli: Cli, config: FileConfig) -> Result<()> {
     }
     let mut children = Vec::with_capacity(workers.len());
     for (device, worker_cli) in workers {
-        env::set_var("PEARL_MEM_MODE", worker_cli.mem_mode.as_str());
-        env::set_var("PEARL_STREAMS", worker_cli.streams.to_string());
-        if let Some(groups) = worker_cli.groups_per_launch {
-            env::set_var("PEARL_GROUPS_PER_LAUNCH", groups.to_string());
-        } else {
-            env::remove_var("PEARL_GROUPS_PER_LAUNCH");
-        }
         let mut child_command = Command::new(&executable);
         child_command.args(["--gpu-worker", "--config"]).arg(&cli.config)
             .arg("--device").arg(device.to_string())
             .arg("--mem-mode").arg(worker_cli.mem_mode.as_str())
             .arg("--vram-budget-gb").arg(worker_cli.vram_budget_gb.to_string())
             .arg("--streams").arg(worker_cli.streams.to_string());
+        child_command
+            .env("PEARL_MEM_MODE", worker_cli.mem_mode.as_str())
+            .env("PEARL_STREAMS", worker_cli.streams.to_string())
+            .env("PEARL_VRAM_BUDGET_GB", worker_cli.vram_budget_gb.to_string());
         if let Some(groups) = worker_cli.groups_per_launch {
-            child_command.arg("--groups-per-launch").arg(groups.to_string());
+            child_command.arg("--groups-per-launch").arg(groups.to_string())
+                .env("PEARL_GROUPS_PER_LAUNCH", groups.to_string());
+        } else {
+            child_command.env_remove("PEARL_GROUPS_PER_LAUNCH");
         }
         match child_command.spawn() {
             Ok(child) => children.push((device, child)),
