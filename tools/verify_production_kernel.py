@@ -22,8 +22,8 @@ source, replacements = re.subn(
 assert replacements == 1
 source = re.sub(r'asm volatile\("cp.async.(?:commit_group|wait_group 0);" ::: "memory"\);', '', source)
 source, replacements = re.subn(
-    r'asm volatile\("mma.sync.aligned.m16n8k32[\s\S]*?"r"\(bf\[j\]\[1\]\)\);',
-    'emulate16(acc[2*i][j], acc[2*i+1][j], af[i], bf[j]);', source)
+    r'asm volatile\("mma.sync.aligned.m16n8k32[\s\S]*?"r"\(bf\[1\]\)\);',
+    'emulate16(acc[2*i][j], acc[2*i+1][j], af[i], bf);', source)
 assert replacements == 1
 
 preamble = r'''
@@ -50,7 +50,7 @@ using std::min;
 struct Dim { unsigned x; } blockIdx;
 thread_local Dim threadIdx;
 struct alignas(16) uint4 { uint32_t x,y,z,w; };
-constexpr unsigned EMU_THREADS = 256;
+constexpr unsigned EMU_THREADS = __CUDA_ARCH__ == 750 ? 512 : 256;
 std::barrier cta_barrier(EMU_THREADS);
 std::array<std::unique_ptr<std::barrier<>>,EMU_THREADS/32> warp_barriers;
 struct Fragment { uint32_t a[4],b[2]; } fragments[EMU_THREADS];
@@ -145,11 +145,16 @@ int main() {
   }
 }
 '''
-with tempfile.TemporaryDirectory(prefix="pearl-production-emulator-") as temp:
-    cpp = Path(temp) / "kernel.cpp"
-    cpp.write_text(preamble + source + main)
-    for arch in (750, 900):  # 1200 takes the same source branch as 900.
-        exe = Path(temp) / f"kernel-{arch}"
-        subprocess.run(shlex.split(os.environ.get("CXX", "c++")) + [
-            "-std=c++20", "-O2", "-pthread", f"-D__CUDA_ARCH__={arch}", str(cpp), "-lstdc++", "-o", str(exe)], check=True)
-        subprocess.run([str(exe)], check=True, timeout=240)
+def run_checks():
+    with tempfile.TemporaryDirectory(prefix="pearl-production-emulator-") as temp:
+        cpp = Path(temp) / "kernel.cpp"
+        cpp.write_text(preamble + source + main)
+        for arch in (750, 1200):  # H100 production is checked by verify_hopper_kernel.py.
+            exe = Path(temp) / f"kernel-{arch}"
+            subprocess.run(shlex.split(os.environ.get("CXX", "c++")) + [
+                "-std=c++20", "-O2", "-pthread", f"-D__CUDA_ARCH__={arch}", str(cpp), "-lstdc++", "-o", str(exe)], check=True)
+            subprocess.run([str(exe)], check=True, timeout=240)
+
+
+if __name__ == "__main__":
+    run_checks()

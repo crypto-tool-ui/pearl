@@ -449,12 +449,38 @@ pub struct ProductionCudaKernel {
     groups_per_launch: u32,
     band: u32,
     scratch: RefCell<ScanScratch>,
+    hopper_maps: RefCell<Option<[sys::CUtensorMap; 2]>>,
 }
 
 struct ScanScratch {
     bound: CudaSlice<u32>,
     count: CudaSlice<u32>,
     hits: CudaSlice<u32>,
+}
+
+// Both operands are row-major [rows, K]; TMA boxes are 128 rows x 64 bytes.
+fn hopper_tensor_map(address: sys::CUdeviceptr, rows: u32, k: usize) -> Result<sys::CUtensorMap> {
+    ensure!(address != 0 && address % 16 == 0 && rows > 0 && k > 0 && k % 64 == 0,
+        "H100 TMA requires aligned matrices and K divisible by 64");
+    let dims = [u64::try_from(k)?, u64::from(rows)];
+    let strides = [dims[0]];
+    let box_dims = [64u32, 128];
+    let element_strides = [1u32, 1];
+    let mut map = sys::CUtensorMap { opaque: [0; 16] };
+    unsafe {
+        sys::cuTensorMapEncodeTiled(
+            &mut map,
+            sys::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            2,
+            address as usize as *mut c_void,
+            dims.as_ptr(), strides.as_ptr(), box_dims.as_ptr(), element_strides.as_ptr(),
+            sys::CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            sys::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
+            sys::CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            sys::CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        ).result()
+    }.context("encoding H100 production tensor map")?;
+    Ok(map)
 }
 
 const HIT_CAPACITY: u32 = 256;
@@ -474,7 +500,7 @@ impl ProductionCudaKernel {
             ),
             (9, 0) => (
                 embedded_cubin!("PEARL_PRODUCTION_SM90"),
-                KernelArchitecture::Sm90Mma,
+                KernelArchitecture::Sm90Wgmma,
                 8,
             ),
             (12, 0) => (
@@ -515,6 +541,7 @@ impl ProductionCudaKernel {
             groups_per_launch,
             band,
             scratch,
+            hopper_maps: RefCell::new(None),
         })
     }
 
@@ -566,15 +593,30 @@ impl ProductionCudaKernel {
                 param(&HIT_CAPACITY),
                 param(&count),
                 param(&hits),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             ];
+            let maps = self.hopper_maps.borrow();
+            let arg_count = if self.architecture == KernelArchitecture::Sm90Wgmma {
+                let maps = maps.as_ref().context("H100 tensor maps were not prepared")?;
+                args[13] = param(&maps[0]);
+                args[14] = param(&maps[1]);
+                15
+            } else {
+                13
+            };
             unsafe {
                 result::launch_kernel(
                     self.scan.function,
                     (groups, 1, 1),
-                    (256, 1, 1),
+                    (
+                        if self.architecture == KernelArchitecture::Sm75Mma { 512 } else { 256 },
+                        1,
+                        1,
+                    ),
                     0,
                     stream.cu_stream(),
-                    &mut args,
+                    &mut args[..arg_count],
                 )
             }?;
         }
@@ -634,8 +676,20 @@ impl GemmKernel for ProductionCudaKernel {
         self.architecture != KernelArchitecture::Sm75Mma
     }
     fn prepare_job(&self, p: &Problem) -> Result<()> {
+        self.hopper_maps.borrow_mut().take();
         self.base.resident.borrow_mut().take();
-        *self.base.resident.borrow_mut() = Some(self.base.prepare_resident_mode(p, self.device_matrix_preparation())?);
+        let job = self.base.prepare_resident_mode(p, self.device_matrix_preparation())?;
+        if self.architecture == KernelArchitecture::Sm90Wgmma {
+            let stream = self.base.context.default_stream();
+            let (a, _a) = job.a.device_ptr(&stream);
+            let (bt, _bt) = job.bt.device_ptr(&stream);
+            let maps = [
+                hopper_tensor_map(a, p.m, p.k())?,
+                hopper_tensor_map(bt, p.n, p.k())?,
+            ];
+            *self.hopper_maps.borrow_mut() = Some(maps);
+        }
+        *self.base.resident.borrow_mut() = Some(job);
         Ok(())
     }
     fn batch_size(&self) -> usize {
@@ -696,7 +750,7 @@ impl GemmKernel for ProductionCudaKernel {
     fn mining_selftest(&self) -> Result<()> {
         // Exercise every lane, both staging buffers, cumulative slot wrap, band tails,
         // inclusive target equality, zero-hit filtering, queue replay, and job replacement.
-        for (m, n, k) in [(128, 128, 256), (256, 384, 2176), (128, 128, 4096)] {
+        for (m, n, k) in [(128, 128, 64), (128, 128, 128), (128, 128, 256), (256, 384, 2176), (128, 128, 4096)] {
             let p = production_test_problem(m, n, k)?;
             self.prepare_job(&p)?;
             let groups = (m / 128) * (n / 128);
@@ -720,14 +774,15 @@ impl GemmKernel for ProductionCudaKernel {
             }
             let first_group = self.scan_groups(&p, 0, 1, [255; 32])?;
             let bound = first_group[37].digest;
-            let expected: Vec<_> = first_group
+            let mut expected: Vec<_> = first_group
                 .into_iter()
                 .filter(|t| le_digest_leq(&t.digest, &bound))
                 .collect();
-            ensure!(
-                self.scan_groups(&p, 0, 1, bound)? == expected,
-                "production target compare mismatch"
-            );
+            let mut actual = self.scan_groups(&p, 0, 1, bound)?;
+            // Atomic hit reservations may arrive in a different order on each launch.
+            expected.sort_by_key(|t| (t.t_rows, t.t_cols));
+            actual.sort_by_key(|t| (t.t_rows, t.t_cols));
+            ensure!(actual == expected, "production target compare mismatch");
             ensure!(
                 self.scan_groups(&p, 0, 1, [0; 32])?.is_empty(),
                 "production zero target mismatch"
@@ -746,6 +801,7 @@ impl GemmKernel for ProductionCudaKernel {
             }
         }
         self.base.resident.borrow_mut().take();
+        self.hopper_maps.borrow_mut().take();
         Ok(())
     }
 }
@@ -756,7 +812,7 @@ pub fn production_test_problem(m: u32, n: u32, k: u32) -> Result<Problem> {
     let header = pearl_ref::test_problem()?.header;
     let config = MiningConfiguration {
         common_dim: k,
-        rank: 128,
+        rank: k.min(128) as u16,
         mma_type: MMAType::Int7xInt7ToInt32,
         moe: None,
         rows_pattern: PeriodicPattern::from_list(&KRYPTEX_ROWS)?,
@@ -1018,5 +1074,30 @@ impl MmaSm75CudaKernel {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod production_host_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_hopper_maps_fail_before_calling_the_cuda_driver() {
+        for (address, rows, k) in [(0, 128, 64), (17, 128, 64), (256, 0, 64),
+                                    (256, 128, 0), (256, 128, 65)] {
+            assert!(hopper_tensor_map(address, rows, k).is_err());
+        }
+        assert_eq!(std::mem::size_of::<sys::CUtensorMap>(), 128);
+        assert!(std::mem::align_of::<sys::CUtensorMap>() >= 64);
+    }
+
+    #[test]
+    fn short_pipeline_fixtures_have_valid_cpu_proofs() {
+        for k in [64, 128] {
+            let problem = production_test_problem(128, 128, k).unwrap();
+            let tile = problem.tile(0, 0).unwrap();
+            assert_eq!(tile.digest,
+                compute_jackpot_hash(&tile.transcript, problem.commitment().a_noise_seed));
+        }
     }
 }

@@ -10,3 +10,5 @@ node_modules/
 __pycache__/
 
 /dist/
+distributed-torch-flashatt-t4/
+prl-5060-miner/

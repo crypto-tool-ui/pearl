@@ -1,10 +1,10 @@
 # Pearl V3 GPU miner
 
 This repository targets Pearl certificate V3 with the official INT7 consensus arithmetic represented
-by INT8 tensor-core operands. Runtime dispatch selects a resident, grouped `mma.sync`
-mining kernel on T4 (sm_75), H100/H200 (sm_90a), or RTX PRO 6000 Blackwell (sm_120a).
+by INT8 tensor-core operands. Runtime dispatch selects grouped MMA on T4 (sm_75)
+and RTX PRO 6000 Blackwell (sm_120), or TMA/WGMMA on H100/H200 (sm_90a).
 Every device must pass the production-kernel CPU comparison at startup. The older
-WGMMA implementation remains an experimental oracle, not the H100 mining path.
+small-tile WGMMA implementation remains available as an experimental oracle.
 A job advertising V4 or an unknown certificate version is paused with `update required`.
 
 Mining credentials are supplied only through `STATEAA`, encoded as
@@ -28,8 +28,9 @@ The miner does not connect directly to a WebSocket URL; configure that URL in `t
 
 Requires Rust 1.88+, a C/C++ toolchain (`build-essential` on Ubuntu), and the
 existing `pearl/` source dependency. For a mining binary, put CUDA 13 `nvcc` on
-PATH (or set `NVCC=/usr/local/cuda/bin/nvcc`) before building. Cubins for sm_75, sm_90a
-and sm_120a are embedded in the executable, so copying the binary is sufficient.
+PATH (or set `NVCC=/usr/local/cuda/bin/nvcc`) before building. Production cubins for sm_75, sm_90a
+and sm_120 (plus the experimental small-tile oracles) are embedded in the
+executable, so copying the binary is sufficient.
 
 
 ```sh
@@ -163,11 +164,15 @@ execution or establish real-pool share acceptance.
 
 ## Production GPU mining: T4, H100 and RTX PRO 6000 Blackwell
 
-The miner embeds separate sm_75, sm_90a and sm_120a cubins. The new scan groups
-128 logical proof tiles in a 128×128 block, reuses matrix operands through two
-shared-memory stages, keeps transcripts in registers and checks targets on GPU.
-T4 uses `m8n8k16` plus register prefetch; H100 and Blackwell use `m16n8k32` plus
-`cp.async`. This is a new grouped MMA path; the old WGMMA kernel is not selected.
+The miner embeds separate sm_75, sm_90a and sm_120 production cubins. Each CTA
+covers a 128×128 matrix tile containing 128 logical proofs and checks targets on GPU.
+T4 uses 512 threads, `m8n8k16`, register prefetch and shared transcripts.
+Blackwell uses 256 threads, `m16n8k32`, two `cp.async` stages and register transcripts.
+H100 uses 256 threads in two warpgroups, `wgmma.m64n128k32.s32.s8.s8`, and two
+TMA tensor-copy stages with 64-byte swizzling. Rust creates the A/B′ tensor maps
+once per job and passes them by value as grid-constant kernel parameters.
+H100 merges four warp contributions into each shared transcript at rank boundaries.
+The current CUDA 13 compiler reports 90 registers/thread and zero spills for H100.
 
 Matrices and official noise remain in VRAM throughout an attempt. Only target
 hits return to a bounded CPU proof worker. The scan continues after finding a
@@ -186,6 +191,7 @@ Without a GPU, validate source arithmetic and cubins with:
 
 ```sh
 python3 tools/verify_production_kernel.py
+python3 tools/verify_hopper_kernel.py
 python3 tools/verify_device_setup.py
 bash tools/check_production_sass.sh
 ```

@@ -24,17 +24,54 @@ build scripts, runners, binary bundles, or kernel dependencies.
 ## Implementation
 
 All three targets use a 128x128x64 CTA and 128 independent 8x16 proof tiles.
-All three targets use eight 32x64 warp tiles (256 threads), with 64 accumulators per lane.
-Pairs of warps compute the two 4x16 halves of a proof. Since transcript XOR and
-rotation are linear, their partial transcripts are merged once after the K loop.
-The merge reuses matrix staging memory after the final reader barrier; there is
-no extra barrier at each rank boundary. CUDA 13 compiles this to 128 registers per
-thread with zero spills, using a two-block launch bound (previously 227 registers
-with 128-thread CTAs). Hardware occupancy and speed still require measurement.
+T4 uses sixteen 16x64 warp tiles (512 threads), with 32 accumulators per lane.
+Blackwell uses eight 32x64 warp tiles (256 threads), with 64 accumulators per lane.
+H100 uses two 64x128 warpgroups (256 threads), also with 64 accumulators per lane.
+Four T4/H100 warps contribute to each proof and merge at each rank milestone into
+128 shared transcripts. Blackwell merges two register transcripts after the K loop.
+XOR and rotation are linear, so each path preserves the same proof arithmetic.
 
-Two shared-memory stages use 32 KiB. T4 prefetches 16-byte global loads through
-registers; H100 and Blackwell use cp.async and m16n8k32 rather than T4's m8n8k16.
-The H100 path is MMA, not WGMMA; no peak-performance claim is made.
+T4 has one 16 KiB matrix stage, 8 KiB of transcripts and 2 KiB of partial folds.
+The next matrix tile is prefetched into registers while the current tile is consumed;
+the stage is overwritten only after the reader barrier. With `launch_bounds(512, 2)`,
+CUDA 13.0.48 reports 64 registers/thread, 26 KiB shared memory and zero spills.
+An initial version keeping all partial transcripts in registers spilled 140 bytes
+of stores and 96 bytes of loads, so that layout was replaced. A forced register cap
+below 64 is not required to fit two blocks in Turing's 64K-register file.
+
+Blackwell retains two matrix stages (32 KiB), cp.async and m16n8k32, using 128
+registers/thread with zero spills. Its staging base is aligned to 256 bytes.
+The SplitMix generator packs eight INT7 bytes with 64-bit masks and preserves the
+reference byte sequence.
+
+H100 production lives in `cuda/production_sm90.cu`, compiled for sm_90a. Each
+K64 iteration issues two signed INT8 m64n128k32 WGMMA operations per warpgroup.
+Two 128x64-byte tensor copies load A and B′ into each stage using TMA SW64.
+The stage base is 1024-byte aligned; WGMMA descriptors use K-major SW64, a 512-byte
+stride between eight-row groups, and a zero swizzle base offset. K offsets 0 and
+32 select the two MMA steps. Tensor maps are encoded once per prepared job using
+`cuTensorMapEncodeTiled`, then passed by value as grid-constant kernel arguments.
+Replacing a job discards its maps before releasing the old device buffers.
+
+A single elected thread initializes and issues each transaction barrier. An async
+proxy fence publishes barrier initialization before TMA. Every consumer waits for
+the matching token before issuing WGMMA. `wgmma.wait_group 0` plus a CTA barrier
+ensures both warpgroups finished reading before a stage is refilled; a second CTA
+barrier publishes the replacement token. Explicit accumulator constraints on the
+fence/wait assembly prevent compiler motion of register accesses across those points. Preloading two stages overlaps next-stage
+TMA with current-stage WGMMA. K64 and final-stage draining need no speculative copy.
+The scan computes work indices in registers, so there is no global work queue to load.
+
+CUDA 13.0.48 reports 90 registers/thread, 43,040 bytes shared memory and zero spills
+for H100. Shared transcripts avoid spilling the 64 accumulators plus two sets of
+16 transcript words. SASS checks require `UTMALDG.2D` and `IGMMA.64x128x32.S8.S8`.
+Compiler reports do not establish achieved occupancy or throughput; those require
+hardware measurement. The startup GPU-vs-CPU self-test remains mandatory.
+
+References: [NVIDIA GPU capabilities](https://developer.nvidia.com/cuda/gpus),
+[Turing tuning guide](https://docs.nvidia.com/cuda/turing-tuning-guide/index.html),
+[Hopper tuning guide](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html),
+[PTX WGMMA shapes](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-instructions-wgmma-mma).
 
 The proof pattern, rank=128, K=4096, keyed BLAKE3, target endianness and official
 CPU proof verifier are preserved. The scan accepts only complete 128x128 groups,
@@ -77,8 +114,7 @@ a share hit, while scanning continues via the bounded proof queue.
 
 The requested 420 TH/s (RTX PRO 6000) and 700 TH/s (H100) are performance targets,
 not measured results. B200 SM100 TMEM/two-SM kernels cannot be reused as SM120
-kernels. H100 still uses the verified MMA path; this change does not introduce a
-WGMMA or persistent TMA kernel. Benchmark scan throughput and live total throughput
+kernels. H100 uses the grouped TMA/WGMMA production path. Benchmark scan throughput and live total throughput
 separately before drawing performance conclusions.
 
 ## Validation and limits
@@ -91,11 +127,15 @@ separately before drawing performance conclusions.
 - `python3 tools/verify_production_kernel.py`: executes the actual CUDA source
   control flow using CPU-emulated PTX fragments. Checks all lanes against scalar
   matrix multiplication at K=128, K=2176 and K=4096, staging, transcript wrap/rotation,
-  target filtering, raster offsets and queue bounds for both instruction branches.
+  target filtering, raster offsets and queue bounds for T4 and Blackwell.
   This does not simulate CUDA scheduling, async-copy timing, or hardware faults.
-- `bash tools/check_production_sass.sh`: compiles sm_75, sm_90a, sm_120a, verifies
-  IMMA instructions, requires async-copy instructions only on newer architectures,
-  and rejects register spills.
+- `python3 tools/verify_hopper_kernel.py`: executes H100 production control flow with
+  CPU-emulated TMA SW64 copies and PTX WGMMA fragments. Checks descriptor fields,
+  all 128 proofs at K=64, 128, 2176 and 4096, transcript wrap, inclusive targets,
+  zero-capacity and overflowing queues, and a partial raster band. This does not
+  emulate hardware async timing or validate the driver-generated tensor-map bytes.
+- `bash tools/check_production_sass.sh`: compiles sm_75, sm_90a and sm_120, requires
+  architecture-appropriate Tensor Core/copy instructions, and rejects register spills.
 - `bash tools/run_production_acceptance.sh`: requires a real supported GPU and
   fails if prerequisites are absent. Tests the same startup self-test, invalid
   ranges/stale jobs, then reports resident throughput on an 8192x8192x4096 fixture.
@@ -107,6 +147,20 @@ Hardware acceptance, sustained hashrate and live-pool acceptance must be measure
 on each target. Compilation and CPU emulation do not establish any of those.
 Use compute-sanitizer memcheck/racecheck/synccheck on the acceptance test binary
 where available before a long mining run.
+
+### Checks for the architecture tuning update
+
+- CUDA 13.0.48 compilation and SASS checks passed for sm_75, sm_90a and sm_120:
+  IMMA on T4/Blackwell, TMA/WGMMA on H100, and zero register spills.
+- The actual production-source CPU emulator passed all 128 transcripts at
+  K=128, 2176 and 4096 for T4/Blackwell. H100 additionally passed K=64 and
+  inclusive-target/zero-capacity cases through `verify_hopper_kernel.py`.
+- The packed INT7 generator matched the previous byte arithmetic for 30,000 words.
+- `cargo check --locked -p pearl-gpu` passed with the CUDA cubins embedded.
+- Two host unit tests passed: invalid tensor layouts fail before driver access,
+  and the K64/K128 startup fixtures produce valid CPU transcripts/digests.
+- The production GPU acceptance test binary built with `--features gpu --no-run`.
+- No physical GPU benchmark or live-pool acceptance was run.
 
 ## Operational acceptance
 
