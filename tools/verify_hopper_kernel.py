@@ -72,6 +72,7 @@ replace_body('h_mma', r'''
 ''')
 replace_body('h_fence', '')
 replace_body('h_commit_wait', '')
+replace_body('h_prefetch_l2', '')
 source, count = re.subn(r'asm volatile\("fence.proxy.async.shared::cta;" ::: "memory"\);', '', source)
 assert count == 1
 assert 'asm volatile' not in source
