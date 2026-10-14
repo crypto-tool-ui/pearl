@@ -11,7 +11,7 @@
 
 namespace {
 constexpr unsigned BM = 128, BN = 128, BK = 64;
-constexpr unsigned MMA_WARPS = 4, PRODUCER_WARPS = 4, THREADS = 256;
+constexpr unsigned MMA_WARPS = 4, THREADS = 256;
 constexpr unsigned STAGES = 4;
 constexpr unsigned A_BYTES = BM * BK, B_BYTES = BN * BK;
 constexpr unsigned STAGE_BYTES = A_BYTES + B_BYTES;
@@ -63,8 +63,9 @@ __device__ __forceinline__ void rotate_right(uint32_t (&t)[16]) {
 #pragma unroll
   for (unsigned i = 0; i < 16; ++i) t[i] = shifted[i];
 }
+} // namespace
 
-__global__ __launch_bounds__(THREADS, 1)
+extern "C" __global__ __launch_bounds__(THREADS, 1)
 void pearl_production_scan_sm120_tma(
     const int8_t* a, const int8_t* bt, unsigned m, unsigned n, unsigned k, unsigned rank,
     unsigned begin, unsigned band, const uint8_t* seed, const uint32_t* bound,
