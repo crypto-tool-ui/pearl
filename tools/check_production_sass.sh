@@ -8,12 +8,19 @@ dump_bin=${CUOBJDUMP:-cuobjdump}
 for arch in sm_75 sm_90a sm_120; do
   source=cuda/production.cu
   if [[ "$arch" == sm_90a ]]; then source=cuda/production_sm90.cu; fi
+  if [[ "$arch" == sm_120 ]]; then source=cuda/production_sm120_tma.cu; fi
+  symbol=pearl_production_scan
+  if [[ "$arch" == sm_120 ]]; then symbol=pearl_production_scan_sm120_tma; fi
   "$nvcc_bin" -std=c++17 -O3 -lineinfo -Xptxas=-v -cubin -arch="$arch" \
     -o "$out_dir/$arch.cubin" "$source" 2>"$out_dir/$arch.log"
-  "$dump_bin" -sass -fun pearl_production_scan "$out_dir/$arch.cubin" >"$out_dir/$arch.sass"
+  "$dump_bin" -sass -fun "$symbol" "$out_dir/$arch.cubin" >"$out_dir/$arch.sass"
   if [[ "$arch" == sm_90a ]]; then
     rg -q 'IGMMA\.64x128x32\.S8\.S8' "$out_dir/$arch.sass"
     rg -q 'UTMALDG' "$out_dir/$arch.sass"
+  elif [[ "$arch" == sm_120 ]]; then
+    rg -q 'IMMA\.16832\.S8\.S8' "$out_dir/$arch.sass"
+    rg -q 'UTMALDG' "$out_dir/$arch.sass"
+    rg -q 'SYNCS' "$out_dir/$arch.sass"
   else
     rg -q 'IMMA' "$out_dir/$arch.sass"
   fi
@@ -26,8 +33,6 @@ for arch in sm_75 sm_90a sm_120; do
     if rg -q 'LDGSTS|WGMMA|QGMMA' "$out_dir/$arch.sass"; then
       echo 'Unsupported Turing instruction' >&2; exit 1
     fi
-  elif [[ "$arch" == sm_120 ]]; then
-    rg -q 'LDGSTS' "$out_dir/$arch.sass"
   fi
   # Keep the compiler's register/resource report visible in CI tuning artifacts.
   cat "$out_dir/$arch.log"

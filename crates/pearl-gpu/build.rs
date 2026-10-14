@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../cuda/sm75_mma.cu");
     println!("cargo:rerun-if-changed=../../cuda/production.cu");
     println!("cargo:rerun-if-changed=../../cuda/production_sm90.cu");
+    println!("cargo:rerun-if-changed=../../cuda/production_sm120_tma.cu");
     println!("cargo:rerun-if-changed=../../cuda/sm120_mma.cu");
     println!("cargo:rerun-if-changed=../../cuda/sm90_wgmma.cu");
     println!("cargo:rerun-if-changed=../../cuda/tensor_hash.cu");
@@ -27,7 +28,11 @@ fn main() {
         ("sm_90a", "PEARL_PRODUCTION_SM90"),
         ("sm_120", "PEARL_PRODUCTION_SM120"),
     ] {
-        let source = if arch == "sm_90a" { "../../cuda/production_sm90.cu" } else { "../../cuda/production.cu" };
+        let (source, env_name) = match arch {
+            "sm_90a" => ("../../cuda/production_sm90.cu", name),
+            "sm_120" => ("../../cuda/production_sm120_tma.cu", "PEARL_PRODUCTION_SM120_TMA"),
+            _ => ("../../cuda/production.cu", name),
+        };
         let output = out_dir.join(format!("pearl_production_{arch}.cubin"));
         let status = Command::new(&nvcc)
             .args(["-std=c++17", "-O3", "-lineinfo", "-Xptxas=-v", "-cubin",
@@ -35,7 +40,7 @@ fn main() {
                 source])
             .status().expect("execute nvcc for production kernel");
         assert!(status.success(), "production kernel compilation failed for {arch}");
-        println!("cargo:rustc-env={name}={}", output.display());
+        println!("cargo:rustc-env={env_name}={}", output.display());
     }
     for (arch, env_name) in [
         ("sm_75", "PEARL_NAIVE_CUBIN_SM75"),

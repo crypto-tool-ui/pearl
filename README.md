@@ -167,7 +167,7 @@ execution or establish real-pool share acceptance.
 The miner embeds separate sm_75, sm_90a and sm_120 production cubins. Each CTA
 covers a 128×128 matrix tile containing 128 logical proofs and checks targets on GPU.
 T4 uses 512 threads, `m8n8k16`, register prefetch and shared transcripts.
-Blackwell uses 256 threads, `m16n8k32`, two `cp.async` stages and register transcripts.
+Blackwell uses 256 threads, `m16n8k32`, a four-stage TMA/mbarrier ring and register transcripts.
 H100 uses 256 threads in two warpgroups, `wgmma.m64n128k32.s32.s8.s8`, and two
 TMA tensor-copy stages with 64-byte swizzling. Rust creates the A/B′ tensor maps
 once per job and passes them by value as grid-constant kernel parameters.

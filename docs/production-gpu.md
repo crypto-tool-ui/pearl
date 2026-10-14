@@ -17,31 +17,37 @@ dispatch was disabled. These are structural throughput limits, not a GH/s conver
   and rank 256. B200 Engine8 uses SM100 TMEM/two-SM instructions. Neither is a
   drop-in T4 kernel; their proof layouts also differ.
 
-The new `cuda/production.cu` implements these general design principles against
-this repository's existing V3 arithmetic. It does not import those projects'
-build scripts, runners, binary bundles, or kernel dependencies.
+The production kernels implement these general design principles against this
+repository's existing V3 arithmetic. Blackwell now follows Spark's TMA/mbarrier
+producer-consumer design in `cuda/production_sm120_tma.cu`, adapted to the
+root miner's 128x128 tile and proof contract. No reference build scripts,
+runners, binary bundles, or kernel dependencies are imported.
 
 ## Implementation
 
 All three targets use a 128x128x64 CTA and 128 independent 8x16 proof tiles.
 T4 uses sixteen 16x64 warp tiles (512 threads), with 32 accumulators per lane.
-Blackwell uses eight 32x64 warp tiles (256 threads), with 64 accumulators per lane.
-H100 uses two 64x128 warpgroups (256 threads), also with 64 accumulators per lane.
+Blackwell uses four 64x64 warp tiles (four MMA warps plus a producer warpgroup,
+256 threads), with 128 accumulators per lane. H100 uses two 64x128 warpgroups
+(256 threads), also with 64 accumulators per lane.
 Four T4/H100 warps contribute to each proof and merge at each rank milestone into
 128 shared transcripts. Blackwell merges two register transcripts after the K loop.
 XOR and rotation are linear, so each path preserves the same proof arithmetic.
 
 T4 has one 16 KiB matrix stage, 8 KiB of transcripts and 2 KiB of partial folds.
-The next matrix tile is prefetched into registers while the current tile is consumed;
-the stage is overwritten only after the reader barrier. With `launch_bounds(512, 2)`,
-CUDA 13.0.48 reports 64 registers/thread, 26 KiB shared memory and zero spills.
+The next matrix tile is loaded into registers before the current tile's MMA work;
+the stage is overwritten only after the reader barrier. Turing has no TMA or
+`cp.async`, so this register preload and two-CTA shared-memory fit are its
+architecture-specific path. With `launch_bounds(512, 2)`, CUDA 13.0.48 reports
+64 registers/thread, 26 KiB shared memory and zero spills.
 An initial version keeping all partial transcripts in registers spilled 140 bytes
 of stores and 96 bytes of loads, so that layout was replaced. A forced register cap
 below 64 is not required to fit two blocks in Turing's 64K-register file.
 
-Blackwell retains two matrix stages (32 KiB), cp.async and m16n8k32, using 128
-registers/thread with zero spills. Its staging base is aligned to 256 bytes.
-The SplitMix generator packs eight INT7 bytes with 64-bit masks and preserves the
+Blackwell loads four 128x64 A/B stages (64 KiB total) with TMA and mbarriers,
+then consumes them with `ldmatrix` and signed `m16n8k32` MMA. The transcript
+fold remains lane-local and the kernel hashes and filters hits on device. The
+SplitMix generator packs eight INT7 bytes with 64-bit masks and preserves the
 reference byte sequence.
 
 H100 production lives in `cuda/production_sm90.cu`, compiled for sm_90a. Each
@@ -58,15 +64,19 @@ proxy fence publishes barrier initialization before TMA. Every consumer waits fo
 the matching token before issuing WGMMA. `wgmma.wait_group 0` plus a CTA barrier
 ensures both warpgroups finished reading before a stage is refilled; a second CTA
 barrier publishes the replacement token. Explicit accumulator constraints on the
-fence/wait assembly prevent compiler motion of register accesses across those points. Preloading two stages overlaps next-stage
-TMA with current-stage WGMMA. K64 and final-stage draining need no speculative copy.
+fence/wait assembly prevent compiler motion of register accesses across those points.
+Preloading two stages overlaps next-stage TMA with current-stage WGMMA. The elected
+producer also issues a bounded L2 tensor prefetch two K tiles ahead while enqueueing
+a stage, only when that tile remains within the tensor-map extent. K64 and final-stage
+draining issue no out-of-range prefetch.
 The scan computes work indices in registers, so there is no global work queue to load.
 
 CUDA 13.0.48 reports 90 registers/thread, 43,040 bytes shared memory and zero spills
 for H100. Shared transcripts avoid spilling the 64 accumulators plus two sets of
 16 transcript words. SASS checks require `UTMALDG.2D` and `IGMMA.64x128x32.S8.S8`.
 Compiler reports do not establish achieved occupancy or throughput; those require
-hardware measurement. The startup GPU-vs-CPU self-test remains mandatory.
+hardware measurement. The L2 lookahead distance is an initial tuning choice, not a
+measured optimum. The startup GPU-vs-CPU self-test remains mandatory.
 
 References: [NVIDIA GPU capabilities](https://developer.nvidia.com/cuda/gpus),
 [Turing tuning guide](https://docs.nvidia.com/cuda/turing-tuning-guide/index.html),
@@ -150,8 +160,10 @@ where available before a long mining run.
 
 ### Checks for the architecture tuning update
 
-- CUDA 13.0.48 compilation and SASS checks passed for sm_75, sm_90a and sm_120:
-  IMMA on T4/Blackwell, TMA/WGMMA on H100, and zero register spills.
+- Prior CUDA 13.0.48 compilation and SASS checks passed for sm_75 and sm_90a before
+  the new H100 L2 prefetch instruction was added, and for sm_120 before its new TMA
+  production kernel was wired in. Neither latest change has been compiled or checked
+  on hardware.
 - The actual production-source CPU emulator passed all 128 transcripts at
   K=128, 2176 and 4096 for T4/Blackwell. H100 additionally passed K=64 and
   inclusive-target/zero-capacity cases through `verify_hopper_kernel.py`.

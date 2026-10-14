@@ -449,7 +449,7 @@ pub struct ProductionCudaKernel {
     groups_per_launch: u32,
     band: u32,
     scratch: RefCell<ScanScratch>,
-    hopper_maps: RefCell<Option<[sys::CUtensorMap; 2]>>,
+    tensor_maps: RefCell<Option<[sys::CUtensorMap; 2]>>,
 }
 
 struct ScanScratch {
@@ -459,9 +459,9 @@ struct ScanScratch {
 }
 
 // Both operands are row-major [rows, K]; TMA boxes are 128 rows x 64 bytes.
-fn hopper_tensor_map(address: sys::CUdeviceptr, rows: u32, k: usize) -> Result<sys::CUtensorMap> {
+fn production_tensor_map(address: sys::CUdeviceptr, rows: u32, k: usize) -> Result<sys::CUtensorMap> {
     ensure!(address != 0 && address % 16 == 0 && rows > 0 && k > 0 && k % 64 == 0,
-        "H100 TMA requires aligned matrices and K divisible by 64");
+        "production TMA requires aligned matrices and K divisible by 64");
     let dims = [u64::try_from(k)?, u64::from(rows)];
     let strides = [dims[0]];
     let box_dims = [64u32, 128];
@@ -479,7 +479,7 @@ fn hopper_tensor_map(address: sys::CUdeviceptr, rows: u32, k: usize) -> Result<s
             sys::CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
             sys::CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
         ).result()
-    }.context("encoding H100 production tensor map")?;
+    }.context("encoding production tensor map")?;
     Ok(map)
 }
 
@@ -504,7 +504,7 @@ impl ProductionCudaKernel {
                 8,
             ),
             (12, 0) => (
-                embedded_cubin!("PEARL_PRODUCTION_SM120"),
+                embedded_cubin!("PEARL_PRODUCTION_SM120_TMA"),
                 KernelArchitecture::Sm120Mma,
                 8,
             ),
@@ -527,7 +527,30 @@ impl ProductionCudaKernel {
         )?
         .saturating_mul(waves)
         .clamp(32, 16384);
-        let scan = load_cuda_kernel(&context, cubin, "pearl_production_scan")?;
+        let scan_symbol = if architecture == KernelArchitecture::Sm120Mma {
+            "pearl_production_scan_sm120_tma"
+        } else {
+            "pearl_production_scan"
+        };
+        let scan = load_cuda_kernel(&context, cubin, scan_symbol)?;
+        if architecture == KernelArchitecture::Sm120Mma {
+            const TMA_SHARED_BYTES: i32 = 66_639;
+            let optin = context.attribute(
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            )?;
+            ensure!(
+                optin >= TMA_SHARED_BYTES,
+                "SM120 TMA kernel needs {TMA_SHARED_BYTES} bytes shared memory, device allows {optin}"
+            );
+            unsafe {
+                result::function::set_function_attribute(
+                    scan.function,
+                    sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    TMA_SHARED_BYTES,
+                )
+            }
+            .context("configuring SM120 TMA shared memory")?;
+        }
         let stream = context.default_stream();
         let scratch = RefCell::new(ScanScratch {
             bound: stream.alloc_zeros::<u32>(8)?,
@@ -541,7 +564,7 @@ impl ProductionCudaKernel {
             groups_per_launch,
             band,
             scratch,
-            hopper_maps: RefCell::new(None),
+            tensor_maps: RefCell::new(None),
         })
     }
 
@@ -596,9 +619,15 @@ impl ProductionCudaKernel {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             ];
-            let maps = self.hopper_maps.borrow();
-            let arg_count = if self.architecture == KernelArchitecture::Sm90Wgmma {
-                let maps = maps.as_ref().context("H100 tensor maps were not prepared")?;
+            let maps = self.tensor_maps.borrow();
+            let needs_maps = matches!(
+                self.architecture,
+                KernelArchitecture::Sm90Wgmma | KernelArchitecture::Sm120Mma
+            );
+            let arg_count = if needs_maps {
+                let maps = maps
+                    .as_ref()
+                    .context("production tensor maps were not prepared")?;
                 args[13] = param(&maps[0]);
                 args[14] = param(&maps[1]);
                 15
@@ -610,11 +639,19 @@ impl ProductionCudaKernel {
                     self.scan.function,
                     (groups, 1, 1),
                     (
-                        if self.architecture == KernelArchitecture::Sm75Mma { 512 } else { 256 },
+                        if self.architecture == KernelArchitecture::Sm75Mma {
+                            512
+                        } else {
+                            256
+                        },
                         1,
                         1,
                     ),
-                    0,
+                    if self.architecture == KernelArchitecture::Sm120Mma {
+                        66_639
+                    } else {
+                        0
+                    },
                     stream.cu_stream(),
                     &mut args[..arg_count],
                 )
@@ -676,18 +713,21 @@ impl GemmKernel for ProductionCudaKernel {
         self.architecture != KernelArchitecture::Sm75Mma
     }
     fn prepare_job(&self, p: &Problem) -> Result<()> {
-        self.hopper_maps.borrow_mut().take();
+        self.tensor_maps.borrow_mut().take();
         self.base.resident.borrow_mut().take();
         let job = self.base.prepare_resident_mode(p, self.device_matrix_preparation())?;
-        if self.architecture == KernelArchitecture::Sm90Wgmma {
+        if matches!(
+            self.architecture,
+            KernelArchitecture::Sm90Wgmma | KernelArchitecture::Sm120Mma
+        ) {
             let stream = self.base.context.default_stream();
             let (a, _a) = job.a.device_ptr(&stream);
             let (bt, _bt) = job.bt.device_ptr(&stream);
             let maps = [
-                hopper_tensor_map(a, p.m, p.k())?,
-                hopper_tensor_map(bt, p.n, p.k())?,
+                production_tensor_map(a, p.m, p.k())?,
+                production_tensor_map(bt, p.n, p.k())?,
             ];
-            *self.hopper_maps.borrow_mut() = Some(maps);
+            *self.tensor_maps.borrow_mut() = Some(maps);
         }
         *self.base.resident.borrow_mut() = Some(job);
         Ok(())
@@ -801,7 +841,7 @@ impl GemmKernel for ProductionCudaKernel {
             }
         }
         self.base.resident.borrow_mut().take();
-        self.hopper_maps.borrow_mut().take();
+        self.tensor_maps.borrow_mut().take();
         Ok(())
     }
 }
@@ -1082,10 +1122,10 @@ mod production_host_tests {
     use super::*;
 
     #[test]
-    fn invalid_hopper_maps_fail_before_calling_the_cuda_driver() {
+    fn invalid_production_maps_fail_before_calling_the_cuda_driver() {
         for (address, rows, k) in [(0, 128, 64), (17, 128, 64), (256, 0, 64),
                                     (256, 128, 0), (256, 128, 65)] {
-            assert!(hopper_tensor_map(address, rows, k).is_err());
+            assert!(production_tensor_map(address, rows, k).is_err());
         }
         assert_eq!(std::mem::size_of::<sys::CUtensorMap>(), 128);
         assert!(std::mem::align_of::<sys::CUtensorMap>() >= 64);

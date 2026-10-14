@@ -36,15 +36,30 @@ __device__ __forceinline__ void h_copy(
       "r"(h_shared(dst)), "l"(map), "r"(k), "r"(row), "r"(h_shared(bar)) : "memory");
 }
 
+__device__ __forceinline__ void h_prefetch_l2(
+    const CUtensorMap* map, unsigned k, unsigned row) {
+  // Keep one additional K tile warm while the two shared-memory stages are consumed.
+  // This is a hint only; correctness still depends on the subsequent TMA copy.
+  asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" ::
+      "l"(map), "r"(k), "r"(row) : "memory");
+}
+
 __device__ __forceinline__ void h_enqueue(
     uint8_t* stage, uint64_t* bar, uint64_t* token,
-    const CUtensorMap* a, const CUtensorMap* b, unsigned kk, unsigned row, unsigned col) {
+    const CUtensorMap* a, const CUtensorMap* b, unsigned kk, unsigned k,
+    unsigned row, unsigned col) {
   uint64_t state;
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 %0, [%1], %2;" : "=l"(state) :
       "r"(h_shared(bar)), "r"(H_STAGE_BYTES) : "memory");
   *token = state;
   h_copy(stage, a, kk, row, bar);
   h_copy(stage + H_OPERAND_BYTES, b, kk, col, bar);
+  if (kk < k && k - kk > 2 * H_BK) {
+    // Prefetch one stage beyond the current pair, when that tile exists.
+    const unsigned next = kk + 2 * H_BK;
+    h_prefetch_l2(a, next, row);
+    h_prefetch_l2(b, next, col);
+  }
 }
 
 __device__ __forceinline__ void h_ready(uint64_t* bar, uint64_t token) {
@@ -122,9 +137,9 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
     h_init(&barriers[1]);
     // Publish barrier initialization to the TMA async proxy before issuing copies.
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    h_enqueue(stages[0], &barriers[0], &tokens[0], &map_a, &map_b, 0, row0, col0);
+    h_enqueue(stages[0], &barriers[0], &tokens[0], &map_a, &map_b, 0, k, row0, col0);
     if (k > H_BK)
-      h_enqueue(stages[1], &barriers[1], &tokens[1], &map_a, &map_b, H_BK, row0, col0);
+      h_enqueue(stages[1], &barriers[1], &tokens[1], &map_a, &map_b, H_BK, k, row0, col0);
   }
   __syncthreads();
   int32_t d[64] = {};
@@ -163,7 +178,7 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
     __syncthreads();
     if (tid == 0 && kk + 2 * H_BK < k)
       h_enqueue(stages[slot], &barriers[slot], &tokens[slot], &map_a, &map_b,
-                kk + 2 * H_BK, row0, col0);
+                kk + 2 * H_BK, k, row0, col0);
     __syncthreads(); // publish the next barrier token to every consumer
   }
   if (tid == 0) atomicAdd(count + 1, 128u);
