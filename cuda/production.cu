@@ -14,16 +14,26 @@
 namespace {
 constexpr unsigned BM = 128, BN = 128, BK = 64;
 #if __CUDA_ARCH__ == 750
-constexpr unsigned THREADS = 512, ACC_ROWS = 2, STAGES = 1;
+constexpr unsigned THREADS = 512, ACC_ROWS = 2;
 #else
-constexpr unsigned THREADS = 256, ACC_ROWS = 4, STAGES = 2;
+constexpr unsigned THREADS = 256, ACC_ROWS = 4;
+#endif
+#if !defined(PEARL_DIRECT_GLOBAL)
+#if __CUDA_ARCH__ == 750
+constexpr unsigned STAGES = 1;
+#else
+constexpr unsigned STAGES = 2;
+#endif
 #endif
 constexpr unsigned MERGE_WARPS = 8 / ACC_ROWS;
 static_assert(THREADS / 32 * ACC_ROWS * 8 * 64 == BM * BN);
 static_assert((BM + BN) * BK % (16 * THREADS) == 0);
+#if !defined(PEARL_DIRECT_GLOBAL)
 constexpr unsigned LOADS = (BM + BN) * BK / 16 / THREADS;
 constexpr unsigned WORDS = (BM + BN) * BK / 4;
+#endif
 constexpr unsigned RECORD_WORDS = 26;
+#if !defined(PEARL_DIRECT_GLOBAL)
 #if __CUDA_ARCH__ == 750
 static_assert(WORDS * 4 + 16 * 128 * 4 + THREADS * 4 <= 32768,
               "two CTAs must fit the Turing shared-memory budget");
@@ -39,6 +49,7 @@ __device__ __forceinline__ unsigned smem_word(unsigned row, unsigned kw) {
 __device__ __forceinline__ uint32_t operand(const uint32_t* s, unsigned row, unsigned byte) {
   return s[smem_word(row, byte / 4)];
 }
+#endif
 
 #if defined(PEARL_DIRECT_GLOBAL)
 __device__ __forceinline__ uint32_t global_operand(
@@ -50,6 +61,7 @@ __device__ __forceinline__ uint32_t global_operand(
 }
 #endif
 
+#if !defined(PEARL_DIRECT_GLOBAL)
 __device__ __forceinline__ void stage_load(
     const int8_t* a, const int8_t* b, unsigned k, unsigned row0, unsigned col0,
     unsigned kk, uint32_t* out, uint4 (&prefetch)[LOADS]) {
@@ -83,6 +95,7 @@ __device__ __forceinline__ void stage_ready(uint32_t* out, const uint4 (&prefetc
 #endif
   __syncthreads();
 }
+#endif
 }
 
 #if defined(PEARL_DIRECT_GLOBAL) && __CUDA_ARCH__ == 750
@@ -143,8 +156,6 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
     const unsigned current = (kk / BK) % STAGES;
     if (kk + BK < k) stage_load(a, bt, k, row0, col0, kk + BK, stages[(current + 1) % STAGES], prefetch);
     const uint32_t* s = stages[current];
-#else
-    const uint32_t* s = nullptr;
 #endif
 #if __CUDA_ARCH__ >= 800
 #pragma unroll

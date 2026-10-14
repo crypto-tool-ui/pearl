@@ -68,7 +68,6 @@ __device__ __forceinline__ void blake3_round(
 __device__ __forceinline__ void blake3_jackpot_hash(
     const uint32_t transcript[16], const uint8_t key[32], uint8_t digest[32]) {
   uint32_t state[16];
-  uint32_t message[16];
   for (uint32_t i = 0; i < 8; ++i) {
     state[i] = load_u32_le(key + i * 4);
     state[i + 8] = i < 4 ? kBlake3Iv[i] : 0;
@@ -77,11 +76,9 @@ __device__ __forceinline__ void blake3_jackpot_hash(
   state[13] = 0;
   state[14] = kBlake3BlockBytes;
   state[15] = kBlake3Flags;
-  for (uint32_t i = 0; i < 16; ++i) {
-    message[i] = transcript[i];
-  }
+#pragma unroll
   for (uint32_t round = 0; round < 7; ++round) {
-    blake3_round(state, message, round);
+    blake3_round(state, transcript, round);
   }
   for (uint32_t i = 0; i < 8; ++i) {
     store_u32_le(digest + i * 4, state[i] ^ state[i + 8]);
