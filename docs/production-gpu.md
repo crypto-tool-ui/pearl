@@ -146,7 +146,8 @@ separately before drawing performance conclusions.
   emulate hardware async timing or validate the driver-generated tensor-map bytes.
 - `bash tools/check_production_sass.sh`: compiles sm_75, sm_80, sm_86, sm_89, sm_90a,
   sm_120 TMA and sm_120 direct-global images; checks their Tensor Core/load paths and rejects
-  register spills.
+  register spills in production images. The opt-in experimental SM120 direct-global images are
+  still checked for their MMA/load paths, while known spills are reported without failing CI.
 - `bash tools/run_production_acceptance.sh`: requires a real supported GPU and
   fails if prerequisites are absent. Tests the same startup self-test, invalid
   ranges/stale jobs, then reports resident throughput on an 8192x8192x4096 fixture.
