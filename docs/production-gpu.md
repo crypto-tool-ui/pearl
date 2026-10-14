@@ -144,8 +144,9 @@ separately before drawing performance conclusions.
   all 128 proofs at K=64, 128, 2176 and 4096, transcript wrap, inclusive targets,
   zero-capacity and overflowing queues, and a partial raster band. This does not
   emulate hardware async timing or validate the driver-generated tensor-map bytes.
-- `bash tools/check_production_sass.sh`: compiles sm_75, sm_90a and sm_120, requires
-  architecture-appropriate Tensor Core/copy instructions, and rejects register spills.
+- `bash tools/check_production_sass.sh`: compiles sm_75, sm_80, sm_86, sm_89, sm_90a,
+  sm_120 TMA and sm_120 direct-global images; checks their Tensor Core/load paths and rejects
+  register spills.
 - `bash tools/run_production_acceptance.sh`: requires a real supported GPU and
   fails if prerequisites are absent. Tests the same startup self-test, invalid
   ranges/stale jobs, then reports resident throughput on an 8192x8192x4096 fixture.
@@ -157,6 +158,13 @@ Hardware acceptance, sustained hashrate and live-pool acceptance must be measure
 on each target. Compilation and CPU emulation do not establish any of those.
 Use compute-sanitizer memcheck/racecheck/synccheck on the acceptance test binary
 where available before a long mining run.
+
+The SM120 TMA scan remains the default. Set `PEARL_SM120_DIRECT_GLOBAL=unpadded` or `padded`
+before startup to select the experimental direct-global `mma.sync` image (the accepted alias
+`1` selects `unpadded`). The padded variant adds 1024 shared-memory bytes. Run the same acceptance
+test and `--gpu-benchmark` on the same RTX PRO 6000 to compare both variants with the default.
+The CPU source emulator checks both operand paths and padding layouts, but only hardware
+measurements can choose the faster path.
 
 ### Checks for the architecture tuning update
 

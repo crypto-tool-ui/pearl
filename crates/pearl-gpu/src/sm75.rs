@@ -448,6 +448,7 @@ pub struct ProductionCudaKernel {
     architecture: KernelArchitecture,
     groups_per_launch: u32,
     band: u32,
+    sm120_direct_global: bool,
     scratch: RefCell<ScanScratch>,
     tensor_maps: RefCell<Option<[sys::CUtensorMap; 2]>>,
 }
@@ -492,11 +493,38 @@ impl ProductionCudaKernel {
     }
 
     pub(crate) fn from_context(context: Arc<CudaContext>) -> Result<Self> {
-        let (cubin, architecture, default_band) = match context.compute_capability()? {
+        let capability = context.compute_capability()?;
+        let sm120_direct_mode = if capability == (12, 0) {
+            std::env::var("PEARL_SM120_DIRECT_GLOBAL").unwrap_or_default()
+        } else {
+            String::new()
+        };
+        ensure!(
+            sm120_direct_mode.is_empty()
+                || matches!(sm120_direct_mode.as_str(), "1" | "unpadded" | "padded"),
+            "PEARL_SM120_DIRECT_GLOBAL must be 1, unpadded or padded"
+        );
+        let sm120_direct_global = !sm120_direct_mode.is_empty();
+        let (cubin, architecture, default_band) = match capability {
             (7, 5) => (
                 embedded_cubin!("PEARL_PRODUCTION_SM75"),
                 KernelArchitecture::Sm75Mma,
                 4,
+            ),
+            (8, 0) => (
+                embedded_cubin!("PEARL_PRODUCTION_SM80"),
+                KernelArchitecture::Sm80Mma,
+                8,
+            ),
+            (8, 6) => (
+                embedded_cubin!("PEARL_PRODUCTION_SM86"),
+                KernelArchitecture::Sm86Mma,
+                8,
+            ),
+            (8, 9) => (
+                embedded_cubin!("PEARL_PRODUCTION_SM89"),
+                KernelArchitecture::Sm89Mma,
+                8,
             ),
             (9, 0) => (
                 embedded_cubin!("PEARL_PRODUCTION_SM90"),
@@ -504,7 +532,15 @@ impl ProductionCudaKernel {
                 8,
             ),
             (12, 0) => (
-                embedded_cubin!("PEARL_PRODUCTION_SM120_TMA"),
+                if sm120_direct_global {
+                    if sm120_direct_mode == "padded" {
+                        embedded_cubin!("PEARL_PRODUCTION_SM120_DIRECT_PADDED")
+                    } else {
+                        embedded_cubin!("PEARL_PRODUCTION_SM120_DIRECT")
+                    }
+                } else {
+                    embedded_cubin!("PEARL_PRODUCTION_SM120_TMA")
+                },
                 KernelArchitecture::Sm120Mma,
                 8,
             ),
@@ -527,13 +563,14 @@ impl ProductionCudaKernel {
         )?
         .saturating_mul(waves)
         .clamp(32, 16384);
-        let scan_symbol = if architecture == KernelArchitecture::Sm120Mma {
+        let sm120_tma = architecture == KernelArchitecture::Sm120Mma && !sm120_direct_global;
+        let scan_symbol = if sm120_tma {
             "pearl_production_scan_sm120_tma"
         } else {
             "pearl_production_scan"
         };
         let scan = load_cuda_kernel(&context, cubin, scan_symbol)?;
-        if architecture == KernelArchitecture::Sm120Mma {
+        if sm120_tma {
             const TMA_SHARED_BYTES: i32 = 66_639;
             let optin = context.attribute(
                 sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
@@ -563,6 +600,7 @@ impl ProductionCudaKernel {
             architecture,
             groups_per_launch,
             band,
+            sm120_direct_global,
             scratch,
             tensor_maps: RefCell::new(None),
         })
@@ -620,10 +658,8 @@ impl ProductionCudaKernel {
                 std::ptr::null_mut(),
             ];
             let maps = self.tensor_maps.borrow();
-            let needs_maps = matches!(
-                self.architecture,
-                KernelArchitecture::Sm90Wgmma | KernelArchitecture::Sm120Mma
-            );
+            let needs_maps = self.architecture == KernelArchitecture::Sm90Wgmma
+                || (self.architecture == KernelArchitecture::Sm120Mma && !self.sm120_direct_global);
             let arg_count = if needs_maps {
                 let maps = maps
                     .as_ref()
@@ -647,7 +683,7 @@ impl ProductionCudaKernel {
                         1,
                         1,
                     ),
-                    if self.architecture == KernelArchitecture::Sm120Mma {
+                    if self.architecture == KernelArchitecture::Sm120Mma && !self.sm120_direct_global {
                         66_639
                     } else {
                         0
@@ -716,10 +752,9 @@ impl GemmKernel for ProductionCudaKernel {
         self.tensor_maps.borrow_mut().take();
         self.base.resident.borrow_mut().take();
         let job = self.base.prepare_resident_mode(p, self.device_matrix_preparation())?;
-        if matches!(
-            self.architecture,
-            KernelArchitecture::Sm90Wgmma | KernelArchitecture::Sm120Mma
-        ) {
+        if self.architecture == KernelArchitecture::Sm90Wgmma
+            || (self.architecture == KernelArchitecture::Sm120Mma && !self.sm120_direct_global)
+        {
             let stream = self.base.context.default_stream();
             let (a, _a) = job.a.device_ptr(&stream);
             let (bt, _bt) = job.bt.device_ptr(&stream);

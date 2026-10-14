@@ -6,6 +6,10 @@
 #define PEARL_PORTABLE_MMA 1
 #include "sm75_mma.cu"
 
+#ifndef PEARL_DIRECT_SMEM_PAD
+#define PEARL_DIRECT_SMEM_PAD 0
+#endif
+
 #ifndef PEARL_HOPPER_PRODUCTION
 namespace {
 constexpr unsigned BM = 128, BN = 128, BK = 64;
@@ -35,6 +39,16 @@ __device__ __forceinline__ unsigned smem_word(unsigned row, unsigned kw) {
 __device__ __forceinline__ uint32_t operand(const uint32_t* s, unsigned row, unsigned byte) {
   return s[smem_word(row, byte / 4)];
 }
+
+#if defined(PEARL_DIRECT_GLOBAL)
+__device__ __forceinline__ uint32_t global_operand(
+    const int8_t* matrix, unsigned row, unsigned k, unsigned ld) {
+  uint32_t value;
+  const int8_t* address = matrix + size_t(row) * ld + k;
+  asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(value) : "l"(address));
+  return value;
+}
+#endif
 
 __device__ __forceinline__ void stage_load(
     const int8_t* a, const int8_t* b, unsigned k, unsigned row0, unsigned col0,
@@ -71,12 +85,25 @@ __device__ __forceinline__ void stage_ready(uint32_t* out, const uint4 (&prefetc
 }
 }
 
+#if defined(PEARL_DIRECT_GLOBAL) && __CUDA_ARCH__ == 750
+extern "C" __global__ __launch_bounds__(THREADS, 1)
+#else
 extern "C" __global__ __launch_bounds__(THREADS, 2)
+#endif
 void pearl_production_scan(const int8_t* a, const int8_t* bt,
     unsigned m, unsigned n, unsigned k, unsigned rank,
     unsigned begin, unsigned band, const uint8_t* seed, const uint32_t* bound,
     unsigned capacity, uint32_t* count, uint32_t* hits) {
+#if defined(PEARL_DIRECT_GLOBAL) && __CUDA_ARCH__ >= 800
+  static_assert(THREADS == 256 && MERGE_WARPS == 2,
+                "direct-global proof merge assumes eight 256-thread warps");
+  constexpr unsigned DIRECT_MERGE_WORDS = THREADS / MERGE_WARPS * 16 + 16 + PEARL_DIRECT_SMEM_PAD / 4;
+  static_assert(DIRECT_MERGE_WORDS * sizeof(uint32_t) == 8256 + PEARL_DIRECT_SMEM_PAD,
+                "direct-global transcript scratch layout changed");
+  __shared__ uint32_t merge_storage[DIRECT_MERGE_WORDS];
+#elif !defined(PEARL_DIRECT_GLOBAL)
   __shared__ __align__(256) uint32_t stages[STAGES][WORDS];
+#endif
 #if __CUDA_ARCH__ == 750
   __shared__ uint32_t proof_transcripts[16][128];
   __shared__ uint32_t folds[THREADS];
@@ -103,29 +130,52 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
 #else
   const unsigned proof = (warp / (2 * MERGE_WARPS)) * 64 + (warp & 1) * 32 + lane;
 #endif
+#if !defined(PEARL_DIRECT_GLOBAL)
   uint4 prefetch[LOADS];
   stage_load(a, bt, k, row0, col0, 0, stages[0], prefetch);
   stage_ready(stages[0], prefetch);
+#endif
+#if defined(PEARL_DIRECT_GLOBAL)
+#pragma unroll 2
+#endif
   for (unsigned kk = 0; kk < k; kk += BK) {
+#if !defined(PEARL_DIRECT_GLOBAL)
     const unsigned current = (kk / BK) % STAGES;
     if (kk + BK < k) stage_load(a, bt, k, row0, col0, kk + BK, stages[(current + 1) % STAGES], prefetch);
     const uint32_t* s = stages[current];
+#else
+    const uint32_t* s = nullptr;
+#endif
 #if __CUDA_ARCH__ >= 800
 #pragma unroll
     for (unsigned sk = 0; sk < BK; sk += 32) {
       uint32_t af[2][4];
 #pragma unroll
       for (unsigned i = 0; i < 2; ++i) {
+#if defined(PEARL_DIRECT_GLOBAL)
+        const unsigned arow = row0 + wr + i * 16 + group;
+        af[i][0] = global_operand(a, arow, kk + sk + pair * 4, k);
+        af[i][1] = global_operand(a, arow + 8, kk + sk + pair * 4, k);
+        af[i][2] = global_operand(a, arow, kk + sk + pair * 4 + 16, k);
+        af[i][3] = global_operand(a, arow + 8, kk + sk + pair * 4 + 16, k);
+#else
         af[i][0] = operand(s, wr + i * 16 + group, sk + pair * 4);
         af[i][1] = operand(s, wr + i * 16 + group + 8, sk + pair * 4);
         af[i][2] = operand(s, wr + i * 16 + group, sk + pair * 4 + 16);
         af[i][3] = operand(s, wr + i * 16 + group + 8, sk + pair * 4 + 16);
+#endif
       }
 #pragma unroll
       for (unsigned j = 0; j < 8; ++j) {
         uint32_t bf[2];
+#if defined(PEARL_DIRECT_GLOBAL)
+        const unsigned brow = col0 + wc + j * 8 + group;
+        bf[0] = global_operand(bt, brow, kk + sk + pair * 4, k);
+        bf[1] = global_operand(bt, brow, kk + sk + pair * 4 + 16, k);
+#else
         bf[0] = operand(s, BM + wc + j * 8 + group, sk + pair * 4);
         bf[1] = operand(s, BM + wc + j * 8 + group, sk + pair * 4 + 16);
+#endif
 #pragma unroll
         for (unsigned i = 0; i < 2; ++i)
           asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -141,11 +191,21 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
     for (unsigned sk = 0; sk < BK; sk += 16) {
       uint32_t af[ACC_ROWS];
 #pragma unroll
-      for (unsigned i = 0; i < ACC_ROWS; ++i)
+      for (unsigned i = 0; i < ACC_ROWS; ++i) {
+#if defined(PEARL_DIRECT_GLOBAL)
+        af[i] = global_operand(a, row0 + wr + i * 8 + group, kk + sk + pair * 4, k);
+#else
         af[i] = operand(s, wr + i * 8 + group, sk + pair * 4);
+#endif
+      }
 #pragma unroll
       for (unsigned j = 0; j < 8; ++j) {
+#if defined(PEARL_DIRECT_GLOBAL)
+        const uint32_t bf = global_operand(bt, col0 + wc + j * 8 + group,
+                                           kk + sk + pair * 4, k);
+#else
         const uint32_t bf = operand(s, BM + wc + j * 8 + group, sk + pair * 4);
+#endif
 #pragma unroll
         for (unsigned i = 0; i < ACC_ROWS; ++i) mma_int8(acc[i][j], af[i], bf);
       }
@@ -179,8 +239,12 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
       transcript[15] = head;
 #endif
     }
+#if defined(PEARL_DIRECT_GLOBAL) && __CUDA_ARCH__ == 750
+    __syncthreads(); // protect the Turing reduction scratch before the next rank slice
+#elif !defined(PEARL_DIRECT_GLOBAL)
     __syncthreads(); // all readers finished before either stage can be reused
     if (kk + BK < k) stage_ready(stages[(current + 1) % STAGES], prefetch);
+#endif
   }
 #if __CUDA_ARCH__ == 750
   if (threadIdx.x == 0) atomicAdd(count + 1, 128u);
@@ -197,12 +261,20 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
     transcript[0] = last;
   }
   // XOR/rotation are linear. Merge two partial proofs after GEMM.
-  // Both stages are dead after the final reader barrier; flatten their storage.
+  // Input staging is dead here; reuse its allocation for transcript merging.
+#if defined(PEARL_DIRECT_GLOBAL)
+  uint32_t* merged = merge_storage;
+#else
   uint32_t* merged = reinterpret_cast<uint32_t*>(stages);
+#endif
   if (part != 0) {
 #pragma unroll
     for (unsigned i = 0; i < 16; ++i)
+#if defined(PEARL_DIRECT_GLOBAL)
+      merged[(threadIdx.x / (MERGE_WARPS * 64) * 64 + threadIdx.x % 64) * 16 + i] = transcript[i];
+#else
       merged[threadIdx.x * 16 + i] = transcript[i];
+#endif
   }
   __syncthreads();
   if (threadIdx.x == 0) atomicAdd(count + 1, 128u);
@@ -211,7 +283,11 @@ void pearl_production_scan(const int8_t* a, const int8_t* bt,
   for (unsigned p = 1; p < MERGE_WARPS; ++p)
 #pragma unroll
     for (unsigned i = 0; i < 16; ++i)
+#if defined(PEARL_DIRECT_GLOBAL)
+      transcript[i] ^= merged[(threadIdx.x / (MERGE_WARPS * 64) * 64 + threadIdx.x % 64) * 16 + i];
+#else
       transcript[i] ^= merged[(threadIdx.x + p * 64) * 16 + i];
+#endif
 #endif
   uint8_t digest[32];
   blake3_jackpot_hash(transcript, seed, digest);

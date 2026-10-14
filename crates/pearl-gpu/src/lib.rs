@@ -49,6 +49,9 @@ pub enum KernelArchitecture {
     Naive,
     Sm120Mma,
     Sm75Mma,
+    Sm80Mma,
+    Sm86Mma,
+    Sm89Mma,
     Sm90Wgmma,
     Sm90Mma,
 }

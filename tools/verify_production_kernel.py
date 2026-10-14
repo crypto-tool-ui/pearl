@@ -147,13 +147,24 @@ int main() {
 '''
 def run_checks():
     with tempfile.TemporaryDirectory(prefix="pearl-production-emulator-") as temp:
-        cpp = Path(temp) / "kernel.cpp"
-        cpp.write_text(preamble + source + main)
-        for arch in (750, 1200):  # H100 production is checked by verify_hopper_kernel.py.
-            exe = Path(temp) / f"kernel-{arch}"
-            subprocess.run(shlex.split(os.environ.get("CXX", "c++")) + [
-                "-std=c++20", "-O2", "-pthread", f"-D__CUDA_ARCH__={arch}", str(cpp), "-lstdc++", "-o", str(exe)], check=True)
-            subprocess.run([str(exe)], check=True, timeout=240)
+        variants = [("staged", source, "")]
+        direct = source.replace(
+            'asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(value) : "l"(address));',
+            'value = *reinterpret_cast<const uint32_t*>(address);')
+        assert direct != source
+        direct_define = "#define PEARL_DIRECT_GLOBAL 1\n"
+        variants.append(("direct", direct, direct_define))
+        variants.append(("direct-padded", direct,
+                         direct_define + "#define PEARL_DIRECT_SMEM_PAD 1024\n"))
+        for name, kernel, defines in variants:
+            cpp = Path(temp) / f"kernel-{name}.cpp"
+            cpp.write_text(defines + preamble + kernel + main)
+            arches = (750, 1200) if name in ("staged", "direct") else (1200,)
+            for arch in arches:  # H100 production is checked by verify_hopper_kernel.py.
+                exe = Path(temp) / f"kernel-{name}-{arch}"
+                subprocess.run(shlex.split(os.environ.get("CXX", "c++")) + [
+                    "-std=c++20", "-O2", "-pthread", f"-D__CUDA_ARCH__={arch}", str(cpp), "-lstdc++", "-o", str(exe)], check=True)
+                subprocess.run([str(exe)], check=True, timeout=240)
 
 
 if __name__ == "__main__":

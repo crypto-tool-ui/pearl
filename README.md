@@ -28,8 +28,8 @@ The miner does not connect directly to a WebSocket URL; configure that URL in `t
 
 Requires Rust 1.88+, a C/C++ toolchain (`build-essential` on Ubuntu), and the
 existing `pearl/` source dependency. For a mining binary, put CUDA 13 `nvcc` on
-PATH (or set `NVCC=/usr/local/cuda/bin/nvcc`) before building. Production cubins for sm_75, sm_90a
-and sm_120 (plus the experimental small-tile oracles) are embedded in the
+PATH (or set `NVCC=/usr/local/cuda/bin/nvcc`) before building. Production cubins for sm_75, sm_80,
+sm_86, sm_89, sm_90a and sm_120 (plus the experimental small-tile oracles) are embedded in the
 executable, so copying the binary is sufficient.
 
 

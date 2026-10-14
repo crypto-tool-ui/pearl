@@ -25,6 +25,9 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     for (arch, name) in [
         ("sm_75", "PEARL_PRODUCTION_SM75"),
+        ("sm_80", "PEARL_PRODUCTION_SM80"),
+        ("sm_86", "PEARL_PRODUCTION_SM86"),
+        ("sm_89", "PEARL_PRODUCTION_SM89"),
         ("sm_90a", "PEARL_PRODUCTION_SM90"),
         ("sm_120", "PEARL_PRODUCTION_SM120"),
     ] {
@@ -34,14 +37,36 @@ fn main() {
             _ => ("../../cuda/production.cu", name),
         };
         let output = out_dir.join(format!("pearl_production_{arch}.cubin"));
-        let status = Command::new(&nvcc)
-            .args(["-std=c++17", "-O3", "-lineinfo", "-Xptxas=-v", "-cubin",
-                &format!("-arch={arch}"), "-o", output.to_str().expect("UTF-8 path"),
-                source])
-            .status().expect("execute nvcc for production kernel");
+        let mut compile = Command::new(&nvcc);
+        compile.args(["-std=c++17", "-O3", "-lineinfo", "-Xptxas=-v", "-cubin",
+            &format!("-arch={arch}"), "-o", output.to_str().expect("UTF-8 path"), source]);
+        if matches!(arch, "sm_75" | "sm_80" | "sm_86" | "sm_89") {
+            compile.arg("-DPEARL_DIRECT_GLOBAL=1");
+            compile.arg(if arch == "sm_75" { "-maxrregcount=122" } else { "-maxrregcount=128" });
+        }
+        let status = compile.status().expect("execute nvcc for production kernel");
         assert!(status.success(), "production kernel compilation failed for {arch}");
         println!("cargo:rustc-env={env_name}={}", output.display());
     }
+
+    let output = out_dir.join("pearl_production_sm_120_direct.cubin");
+    let status = Command::new(&nvcc)
+        .args(["-std=c++17", "-O3", "-lineinfo", "-Xptxas=-v", "-cubin",
+            "-arch=sm_120", "-DPEARL_DIRECT_GLOBAL=1", "-maxrregcount=128", "-o",
+            output.to_str().expect("UTF-8 path"), "../../cuda/production.cu"])
+        .status().expect("execute nvcc for direct-global sm_120 production kernel");
+    assert!(status.success(), "direct-global production kernel compilation failed for sm_120");
+    println!("cargo:rustc-env=PEARL_PRODUCTION_SM120_DIRECT={}", output.display());
+
+    let output = out_dir.join("pearl_production_sm_120_direct_padded.cubin");
+    let status = Command::new(&nvcc)
+        .args(["-std=c++17", "-O3", "-lineinfo", "-Xptxas=-v", "-cubin",
+            "-arch=sm_120", "-DPEARL_DIRECT_GLOBAL=1", "-DPEARL_DIRECT_SMEM_PAD=1024",
+            "-maxrregcount=128", "-o", output.to_str().expect("UTF-8 path"),
+            "../../cuda/production.cu"])
+        .status().expect("execute nvcc for padded direct-global sm_120 production kernel");
+    assert!(status.success(), "padded direct-global production kernel compilation failed for sm_120");
+    println!("cargo:rustc-env=PEARL_PRODUCTION_SM120_DIRECT_PADDED={}", output.display());
     for (arch, env_name) in [
         ("sm_75", "PEARL_NAIVE_CUBIN_SM75"),
         ("sm_90", "PEARL_NAIVE_CUBIN_SM90"),
